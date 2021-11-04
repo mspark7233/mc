@@ -22,6 +22,9 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+	
+	"golang.org/x/text/encoding/korean"
+        "golang.org/x/text/transform"
 
 	// golang does not support flat keys for path matching, find does
 
@@ -169,6 +172,46 @@ func dirDifference(ctx context.Context, sourceClnt, targetClnt Client, sourceURL
 	return difference(ctx, sourceClnt, targetClnt, sourceURL, targetURL, false, false, true, DirFirst)
 }
 
+func isCP949(s string) bool {
+        ret := false
+        sz := len(s)
+        for i := 0 ; i < sz ; i++ {
+                si := s[i]
+                if( si >= 0x20 && si <=0x7E ) {
+                        continue
+                }
+                if i+1 < sz && ( si >= 0x81 || si <= 0xC6)  {
+                        si2 := s[i+1]
+                        if ( si2 >= 0x41 && si2 <= 0x5A ) ||
+                                ( si2 >= 0x61 && si2 <= 0x7A ) ||
+                                ( si2 >= 0x81 && si2 <= 0xFE ) {
+                                ret = true;
+                                i++
+                        } else {
+                                return false
+                        }
+                } else {
+                        return false
+                }
+        }
+        return ret
+}
+
+func iconvCP949ToUTF8(s string) string {
+        if isCP949(s) {
+                ret, n, err := transform.String(korean.EUCKR.NewDecoder(), s)
+                if err != nil {
+                        return s
+                }
+
+                if n >= 0 {
+                        return ret
+                }
+        }
+
+        return s
+}
+
 func differenceInternal(ctx context.Context, sourceClnt, targetClnt Client, sourceURL, targetURL string, isMetadata bool, isRecursive, returnSimilar bool, dirOpt DirOpt, diffCh chan<- diffMessage) *probe.Error {
 	// Set default values for listing.
 	srcCh := sourceClnt.List(ctx, ListOptions{Recursive: isRecursive, WithMetadata: isMetadata, ShowDir: dirOpt})
@@ -220,7 +263,7 @@ func differenceInternal(ctx context.Context, sourceClnt, targetClnt Client, sour
 			continue
 		}
 
-		srcSuffix := strings.TrimPrefix(srcCtnt.URL.String(), sourceURL)
+		srcSuffix := iconvCP949ToUTF8(strings.TrimPrefix(srcCtnt.URL.String(), sourceURL))
 		tgtSuffix := strings.TrimPrefix(tgtCtnt.URL.String(), targetURL)
 
 		current := urlJoinPath(targetURL, srcSuffix)
@@ -258,7 +301,7 @@ func differenceInternal(ctx context.Context, sourceClnt, targetClnt Client, sour
 			srcType, tgtType := srcCtnt.Type, tgtCtnt.Type
 			srcSize, tgtSize := srcCtnt.Size, tgtCtnt.Size
 			if srcType.IsRegular() && !tgtType.IsRegular() ||
-				!srcType.IsRegular() && tgtType.IsRegular() {
+				!srcType.IsRegular() && tgtType.IsRegular() { 
 				// Type differs. Source is never a directory.
 				diffCh <- diffMessage{
 					FirstURL:      srcCtnt.URL.String(),
@@ -312,6 +355,7 @@ func differenceInternal(ctx context.Context, sourceClnt, targetClnt Client, sour
 			}
 			srcCtnt, srcOk = <-srcCh
 			tgtCtnt, tgtOk = <-tgtCh
+
 			continue
 		}
 		// Differ in second

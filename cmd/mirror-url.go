@@ -164,7 +164,7 @@ func deltaSourceTarget(ctx context.Context, sourceURL, targetURL string, opts mi
 
 			sourceSuffix := strings.TrimPrefix(diffMsg.FirstURL, sourceURL)
 			// Either available only in source or size differs and force is set
-			targetPath := urlJoinPath(targetURL, sourceSuffix)
+			targetPath := iconvCP949ToUTF8(urlJoinPath(targetURL, sourceSuffix))
 			sourceContent := diffMsg.firstContent
 			targetContent := &ClientContent{URL: *newClientURL(targetPath)}
 			URLsCh <- URLs{
@@ -176,7 +176,7 @@ func deltaSourceTarget(ctx context.Context, sourceURL, targetURL string, opts mi
 		case differInFirst:
 			// Only in first, always copy.
 			sourceSuffix := strings.TrimPrefix(diffMsg.FirstURL, sourceURL)
-			targetPath := urlJoinPath(targetURL, sourceSuffix)
+			targetPath := iconvCP949ToUTF8(urlJoinPath(targetURL, sourceSuffix))
 			sourceContent := diffMsg.firstContent
 			targetContent := &ClientContent{URL: *newClientURL(targetPath)}
 			URLsCh <- URLs{
