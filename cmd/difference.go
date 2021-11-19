@@ -22,10 +22,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-	
 	"golang.org/x/text/encoding/korean"
         "golang.org/x/text/transform"
-
 	// golang does not support flat keys for path matching, find does
 
 	"github.com/minio/mc/pkg/probe"
@@ -180,13 +178,15 @@ func isCP949(s string) bool {
                 if( si >= 0x20 && si <=0x7E ) {
                         continue
                 }
-                if i+1 < sz && ( si >= 0x81 || si <= 0xC6)  {
-                        si2 := s[i+1]
-                        if ( si2 >= 0x41 && si2 <= 0x5A ) ||
-                                ( si2 >= 0x61 && si2 <= 0x7A ) ||
-                                ( si2 >= 0x81 && si2 <= 0xFE ) {
-                                ret = true;
-                                i++
+                if i+1 < sz {
+			si2 := s[i+1]
+
+			if( ((si >= 0xA1 && si <0xFE) && (si2 >= 0xA1 && si2 <=0xFE)) ||
+			((si >= 0x81 && si <= 0xA0) && ((si2 >= 0x41 && si2 <= 0x5A) || (si2 >= 0x61 && si2 <= 0x7A) || (si2 >= 0x81 && si2 <= 0xFE))) ||
+			((si >= 0xA1 && si <= 0xC5) && ((si2 >= 0x41 && si2 <= 0x5A) || (si2 >= 0x61 && si2 <= 0x7A) || (si2 >= 0x81 && si2 <= 0xA0))) ||
+			((si == 0xC6) && ((si2 >= 0x41 && si2 <= 0x52)))){
+				ret = true;
+				i++
                         } else {
                                 return false
                         }
