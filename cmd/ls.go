@@ -21,12 +21,11 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
 
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 	json "github.com/minio/colorjson"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/pkg/console"
@@ -51,6 +50,7 @@ type contentMessage struct {
 	VersionOrd     int    `json:"versionOrdinal,omitempty"`
 	VersionIndex   int    `json:"versionIndex,omitempty"`
 	IsDeleteMarker bool   `json:"isDeleteMarker,omitempty"`
+	StorageClass   string `json:"storageClass,omitempty"`
 }
 
 // String colorized string message.
@@ -58,6 +58,10 @@ func (c contentMessage) String() string {
 	message := console.Colorize("Time", fmt.Sprintf("[%s]", c.Time.Format(printDate)))
 	message += console.Colorize("Size", fmt.Sprintf("%7s", strings.Join(strings.Fields(humanize.IBytes(uint64(c.Size))), "")))
 	fileDesc := ""
+
+	if c.StorageClass != "" {
+		message += " " + console.Colorize("SC", c.StorageClass)
+	}
 
 	if c.VersionID != "" {
 		fileDesc += console.Colorize("VersionID", " "+c.VersionID) + console.Colorize("VersionOrd", fmt.Sprintf(" v%d", c.VersionOrd))
@@ -90,12 +94,6 @@ func (c contentMessage) JSON() string {
 // Use OS separator and adds a trailing separator if it is a dir
 func getOSDependantKey(path string, isDir bool) string {
 	sep := "/"
-
-	// for windows make sure to print in 'windows' specific style.
-	if runtime.GOOS == "windows" {
-		path = strings.Replace(path, "/", "\\", -1)
-		sep = "\\"
-	}
 
 	if isDir && !strings.HasSuffix(path, sep) {
 		return fmt.Sprintf("%s%s", path, sep)
@@ -138,6 +136,7 @@ func generateContentMessages(clntURL ClientURL, ctnts []*ClientContent, printAll
 		}()
 
 		contentMsg.Size = c.Size
+		contentMsg.StorageClass = c.StorageClass
 		md5sum := strings.TrimPrefix(c.ETag, "\"")
 		md5sum = strings.TrimSuffix(md5sum, "\"")
 		contentMsg.ETag = md5sum
@@ -201,9 +200,18 @@ func printObjectVersions(clntURL ClientURL, ctntVersions []*ClientContent, print
 	}
 }
 
-// doList - list all entities inside a folder.
-func doList(ctx context.Context, clnt Client, isRecursive, isIncomplete, isSummary bool, timeRef time.Time, withOlderVersions bool) error {
+type doListOptions struct {
+	timeRef           time.Time
+	isRecursive       bool
+	isIncomplete      bool
+	isSummary         bool
+	withOlderVersions bool
+	listZip           bool
+	filter            string
+}
 
+// doList - list all entities inside a folder.
+func doList(ctx context.Context, clnt Client, o doListOptions) error {
 	var (
 		lastPath          string
 		perObjectVersions []*ClientContent
@@ -213,12 +221,13 @@ func doList(ctx context.Context, clnt Client, isRecursive, isIncomplete, isSumma
 	)
 
 	for content := range clnt.List(ctx, ListOptions{
-		Recursive:         isRecursive,
-		Incomplete:        isIncomplete,
-		TimeRef:           timeRef,
-		WithOlderVersions: withOlderVersions || !timeRef.IsZero(),
+		Recursive:         o.isRecursive,
+		Incomplete:        o.isIncomplete,
+		TimeRef:           o.timeRef,
+		WithOlderVersions: o.withOlderVersions || !o.timeRef.IsZero(),
 		WithDeleteMarkers: true,
 		ShowDir:           DirNone,
+		ListZip:           o.listZip,
 	}) {
 		if content.Err != nil {
 			switch content.Err.ToGoError().(type) {
@@ -241,13 +250,13 @@ func doList(ctx context.Context, clnt Client, isRecursive, isIncomplete, isSumma
 			continue
 		}
 
-		if content.StorageClass == s3StorageClassGlacier {
+		if content.StorageClass != "" && o.filter != "" && o.filter != "*" && content.StorageClass != o.filter {
 			continue
 		}
 
 		if lastPath != content.URL.Path {
 			// Print any object in the current list before reinitializing it
-			printObjectVersions(clnt.GetURL(), perObjectVersions, withOlderVersions, isSummary)
+			printObjectVersions(clnt.GetURL(), perObjectVersions, o.withOlderVersions, o.isSummary)
 			lastPath = content.URL.Path
 			perObjectVersions = []*ClientContent{}
 		}
@@ -257,9 +266,9 @@ func doList(ctx context.Context, clnt Client, isRecursive, isIncomplete, isSumma
 		totalObjects++
 	}
 
-	printObjectVersions(clnt.GetURL(), perObjectVersions, withOlderVersions, isSummary)
+	printObjectVersions(clnt.GetURL(), perObjectVersions, o.withOlderVersions, o.isSummary)
 
-	if isSummary {
+	if o.isSummary {
 		printMsg(summaryMessage{
 			TotalObjects: totalObjects,
 			TotalSize:    totalSize,

@@ -232,10 +232,6 @@ const uaMirrorAppName = "mc-mirror"
 type mirrorJob struct {
 	stopCh chan struct{}
 
-	// mutex for shutdown, this prevents the shutdown
-	// to be initiated multiple times
-	m sync.Mutex
-
 	// the global watcher object, which receives notifications of created
 	// and deleted files
 	watcher *Watcher
@@ -313,12 +309,14 @@ func (mj *mirrorJob) doDeleteBucket(ctx context.Context, sURLs URLs) URLs {
 		return sURLs.WithError(pErr)
 	}
 
-	var contentCh = make(chan *ClientContent, 1)
+	contentCh := make(chan *ClientContent, 1)
 	contentCh <- &ClientContent{URL: clnt.GetURL()}
 	close(contentCh)
 
-	for err := range clnt.Remove(ctx, false, true, false, contentCh) {
-		return sURLs.WithError(err)
+	for result := range clnt.Remove(ctx, false, true, false, contentCh) {
+		if result.Err != nil {
+			return sURLs.WithError(result.Err)
+		}
 	}
 
 	return sURLs.WithError(nil)
@@ -341,15 +339,15 @@ func (mj *mirrorJob) doRemove(ctx context.Context, sURLs URLs) URLs {
 	contentCh <- &ClientContent{URL: *newClientURL(sURLs.TargetContent.URL.Path)}
 	close(contentCh)
 	isRemoveBucket := false
-	errorCh := clnt.Remove(ctx, false, isRemoveBucket, false, contentCh)
-	for pErr := range errorCh {
-		if pErr != nil {
-			switch pErr.ToGoError().(type) {
+	resultCh := clnt.Remove(ctx, false, isRemoveBucket, false, contentCh)
+	for result := range resultCh {
+		if result.Err != nil {
+			switch result.Err.ToGoError().(type) {
 			case PathInsufficientPermission:
 				// Ignore Permission error.
 				continue
 			}
-			return sURLs.WithError(pErr)
+			return sURLs.WithError(result.Err)
 		}
 	}
 
@@ -405,7 +403,6 @@ func convertSizeToTag(size int64) string {
 
 // doMirror - Mirror an object to multiple destination. URLs status contains a copy of sURLs and error if any.
 func (mj *mirrorJob) doMirror(ctx context.Context, sURLs URLs) URLs {
-
 	if sURLs.Error != nil { // Erroneous sURLs passed.
 		return sURLs.WithError(sURLs.Error.Trace())
 	}
@@ -462,7 +459,7 @@ func (mj *mirrorJob) doMirror(ctx context.Context, sURLs URLs) URLs {
 	sURLs.DisableMultipart = mj.opts.disableMultipart
 
 	now := time.Now()
-	ret := uploadSourceToTargetURL(ctx, sURLs, mj.status, mj.opts.encKeyDB, mj.opts.isMetadata)
+	ret := uploadSourceToTargetURL(ctx, sURLs, mj.status, mj.opts.encKeyDB, mj.opts.isMetadata, false)
 	if ret.Error == nil {
 		durationMs := time.Since(now) / time.Millisecond
 		mirrorReplicationDurations.With(prometheus.Labels{"object_size": convertSizeToTag(sURLs.SourceContent.Size)}).Observe(float64(durationMs))
@@ -471,12 +468,21 @@ func (mj *mirrorJob) doMirror(ctx context.Context, sURLs URLs) URLs {
 }
 
 // Update progress status
-func (mj *mirrorJob) monitorMirrorStatus() (errDuringMirror bool) {
+func (mj *mirrorJob) monitorMirrorStatus(cancel context.CancelFunc) (errDuringMirror bool) {
 	// now we want to start the progress bar
 	mj.status.Start()
 	defer mj.status.Finish()
 
+	var cancelInProgress bool
+
 	for sURLs := range mj.statusCh {
+		if cancelInProgress {
+			// Do not need to print any error after
+			// canceling the context, just draining
+			// the status channel here.
+			continue
+		}
+
 		// Update prometheus fields
 		mirrorTotalOps.Inc()
 
@@ -503,9 +509,11 @@ func (mj *mirrorJob) monitorMirrorStatus() (errDuringMirror bool) {
 				}
 				errDuringMirror = true
 			}
+
 			if mj.opts.activeActive {
-				close(mj.stopCh)
-				break
+				cancel()
+				cancelInProgress = true
+				continue
 			}
 		}
 
@@ -551,7 +559,7 @@ func (mj *mirrorJob) watchMirrorEvents(ctx context.Context, events []EventInfo) 
 		// build target path, it is the relative of the eventPath with the sourceUrl
 		// joined to the targetURL.
 		sourceSuffix := strings.TrimPrefix(eventPath, sourceURLFull)
-		//Skip the object, if it matches the Exclude options provided
+		// Skip the object, if it matches the Exclude options provided
 		if matchExcludeOptions(mj.opts.excludeOptions, sourceSuffix) {
 			continue
 		}
@@ -636,18 +644,18 @@ func (mj *mirrorJob) watchMirrorEvents(ctx context.Context, events []EventInfo) 
 }
 
 // this goroutine will watch for notifications, and add modified objects to the queue
-func (mj *mirrorJob) watchMirror(ctx context.Context, stopParallel func()) {
+func (mj *mirrorJob) watchMirror(ctx context.Context) {
+	defer mj.watcher.Stop()
+
 	for {
 		select {
 		case events, ok := <-mj.watcher.Events():
 			if !ok {
-				stopParallel()
 				return
 			}
 			mj.watchMirrorEvents(ctx, events)
 		case err, ok := <-mj.watcher.Errors():
 			if !ok {
-				stopParallel()
 				return
 			}
 			switch err.ToGoError().(type) {
@@ -661,8 +669,7 @@ func (mj *mirrorJob) watchMirror(ctx context.Context, stopParallel func()) {
 					return URLs{Error: err}
 				}, 0)
 			}
-		case <-globalContext.Done():
-			stopParallel()
+		case <-ctx.Done():
 			return
 		}
 	}
@@ -673,18 +680,13 @@ func (mj *mirrorJob) watchURL(ctx context.Context, sourceClient Client) *probe.E
 }
 
 // Fetch urls that need to be mirrored
-func (mj *mirrorJob) startMirror(ctx context.Context, cancelMirror context.CancelFunc, stopParallel func()) {
-	// Do not run multiple startMirror's
-	mj.m.Lock()
-	defer mj.m.Unlock()
-
+func (mj *mirrorJob) startMirror(ctx context.Context) {
 	URLsCh := prepareMirrorURLs(ctx, mj.sourceURL, mj.targetURL, mj.opts)
 
 	for {
 		select {
 		case sURLs, ok := <-URLsCh:
 			if !ok {
-				stopParallel()
 				return
 			}
 			if sURLs.Error != nil {
@@ -722,31 +724,25 @@ func (mj *mirrorJob) startMirror(ctx context.Context, cancelMirror context.Cance
 					return mj.doRemove(ctx, sURLs)
 				}, 0)
 			}
-		case <-globalContext.Done():
-			stopParallel()
+		case <-ctx.Done():
 			return
 		case <-mj.stopCh:
-			stopParallel()
 			return
 		}
 	}
 }
 
 // when using a struct for copying, we could save a lot of passing of variables
-func (mj *mirrorJob) mirror(ctx context.Context, cancelMirror context.CancelFunc) bool {
-
+func (mj *mirrorJob) mirror(ctx context.Context) bool {
 	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(ctx)
 
 	// Starts watcher loop for watching for new events.
 	if mj.opts.isWatch {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			stopParallel := func() {
-				mj.parallel.stopAndWait()
-				cancelMirror()
-			}
-			mj.watchMirror(ctx, stopParallel)
+			mj.watchMirror(ctx)
 		}()
 	}
 
@@ -754,23 +750,18 @@ func (mj *mirrorJob) mirror(ctx context.Context, cancelMirror context.CancelFunc
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		stopParallel := func() {
-			if !mj.opts.isWatch {
-				mj.parallel.stopAndWait()
-				cancelMirror()
-			}
-		}
 		// startMirror locks and blocks itself.
-		mj.startMirror(ctx, cancelMirror, stopParallel)
+		mj.startMirror(ctx)
 	}()
 
 	// Close statusCh when both watch & mirror quits
 	go func() {
 		wg.Wait()
+		mj.parallel.stopAndWait()
 		close(mj.statusCh)
 	}()
 
-	return mj.monitorMirrorStatus()
+	return mj.monitorMirrorStatus(cancel)
 }
 
 func newMirrorJob(srcURL, dstURL string, opts mirrorOptions) *mirrorJob {
@@ -907,7 +898,7 @@ func runMirror(ctx context.Context, cancelMirror context.CancelFunc, srcURL, dst
 
 	if mirrorSrcBuckets || createDstBuckets {
 		// Synchronize buckets using dirDifference function
-		for d := range dirDifference(ctx, srcClt, dstClt, srcURL, dstURL) {
+		for d := range dirDifference(ctx, srcClt, dstClt) {
 			if d.Error != nil {
 				if mj.opts.activeActive {
 					errorIf(d.Error, "Failed to start mirroring.. retrying")
@@ -984,7 +975,7 @@ func runMirror(ctx context.Context, cancelMirror context.CancelFunc, srcURL, dst
 		}
 	}
 
-	return mj.mirror(ctx, cancelMirror)
+	return mj.mirror(ctx)
 }
 
 // Main entry point for mirror command.
@@ -1008,7 +999,6 @@ func mainMirror(cliCtx *cli.Context) error {
 			if e := http.ListenAndServe(prometheusAddress, nil); e != nil {
 				fatalIf(probe.NewError(e), "Unable to setup monitoring endpoint.")
 			}
-
 		}()
 	}
 

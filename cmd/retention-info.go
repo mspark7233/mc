@@ -31,30 +31,28 @@ import (
 	"github.com/minio/pkg/console"
 )
 
-var (
-	retentionInfoFlags = []cli.Flag{
-		cli.BoolFlag{
-			Name:  "recursive, r",
-			Usage: "show retention info recursively",
-		},
-		cli.StringFlag{
-			Name:  "version-id, vid",
-			Usage: "show retention info of specific object version",
-		},
-		cli.StringFlag{
-			Name:  "rewind",
-			Usage: "roll back object(s) to current version at specified time",
-		},
-		cli.BoolFlag{
-			Name:  "versions",
-			Usage: "show retention info on object(s) and all its versions",
-		},
-		cli.BoolFlag{
-			Name:  "default",
-			Usage: "show bucket default retention mode",
-		},
-	}
-)
+var retentionInfoFlags = []cli.Flag{
+	cli.BoolFlag{
+		Name:  "recursive, r",
+		Usage: "show retention info recursively",
+	},
+	cli.StringFlag{
+		Name:  "version-id, vid",
+		Usage: "show retention info of specific object version",
+	},
+	cli.StringFlag{
+		Name:  "rewind",
+		Usage: "roll back object(s) to current version at specified time",
+	},
+	cli.BoolFlag{
+		Name:  "versions",
+		Usage: "show retention info on object(s) and all its versions",
+	},
+	cli.BoolFlag{
+		Name:  "default",
+		Usage: "show bucket default retention mode",
+	},
+}
 
 var retentionInfoCmd = cli.Command{
 	Name:         "info",
@@ -87,11 +85,16 @@ EXAMPLES:
      $ {{.HelpName}} myminio/mybucket/prefix --recursive --versions
 
   5. Show default lock retention configuration for a bucket
-     $ {{.HelpName}} --default myminio/mybucket/
-`}
+     $ {{.HelpName}} myminio/mybucket/ --default
+`,
+}
 
 func parseInfoRetentionArgs(cliCtx *cli.Context) (target, versionID string, recursive bool, timeRef time.Time, withVersions, defaultMode bool) {
 	args := cliCtx.Args()
+
+	if len(args) != 1 {
+		cli.ShowCommandHelpAndExit(cliCtx, "info", 1)
+	}
 
 	target = args[0]
 	if target == "" {
@@ -103,6 +106,11 @@ func parseInfoRetentionArgs(cliCtx *cli.Context) (target, versionID string, recu
 	withVersions = cliCtx.Bool("versions")
 	recursive = cliCtx.Bool("recursive")
 	defaultMode = cliCtx.Bool("default")
+
+	if defaultMode && (versionID != "" || !timeRef.IsZero() || withVersions || recursive) {
+		fatalIf(errDummy(), "--default flag cannot be specified with any of --version-id, --rewind, --versions, --recursive.")
+	}
+
 	return
 }
 
@@ -273,9 +281,11 @@ func infoRetentionSingle(ctx context.Context, alias, url, versionID string, list
 	if err != nil {
 		errResp := minio.ToErrorResponse(err.ToGoError())
 		if errResp.Code != "NoSuchObjectLockConfiguration" {
-			msg.SetErr(err.ToGoError())
-			msg.SetStatus("failure")
-			printMsg(msg)
+			if _, ok := err.ToGoError().(ObjectNameEmpty); !ok {
+				msg.SetErr(err.ToGoError())
+				msg.SetStatus("failure")
+				printMsg(msg)
+			}
 			return err
 		}
 		err = nil
@@ -307,6 +317,10 @@ func getRetention(ctx context.Context, target, versionID string, timeRef time.Ti
 	if versionID != "" || !isRecursive && !withOlderVersions {
 		err := infoRetentionSingle(ctx, alias, urlStr, versionID, false)
 		if err != nil {
+			if _, ok := err.ToGoError().(ObjectNameEmpty); ok {
+				console.Infoln("no object name specified, showing bucket default retention mode instead")
+				return showBucketLock(target)
+			}
 			return exitStatus(globalErrorExitStatus)
 		}
 		return nil
@@ -365,10 +379,6 @@ func mainRetentionInfo(cliCtx *cli.Context) error {
 	console.SetColor("RetentionVersionID", color.New(color.FgGreen))
 	console.SetColor("RetentionExpired", color.New(color.FgRed, color.Bold))
 	console.SetColor("RetentionFailure", color.New(color.FgYellow))
-
-	if len(cliCtx.Args()) != 1 {
-		cli.ShowCommandHelpAndExit(cliCtx, "info", 1)
-	}
 
 	target, versionID, recursive, rewind, withVersions, bucketMode := parseInfoRetentionArgs(cliCtx)
 

@@ -67,8 +67,8 @@ EXAMPLES:
   1. Show console logs for a MinIO server with alias 'play'
      {{.Prompt}} {{.HelpName}} play
 
-  2. Show last 5 log entries for node 'node1' on MinIO server with alias 'cluster1'
-     {{.Prompt}} {{.HelpName}} --limit 5 cluster1 node1
+  2. Show last 5 log entries for node 'node1' on MinIO server with alias 'myminio'
+     {{.Prompt}} {{.HelpName}} --limit 5 myminio node1
 
   3. Show application error logs on MinIO server with alias 'play'
      {{.Prompt}} {{.HelpName}} --type application play
@@ -94,8 +94,8 @@ func (l logMessage) JSON() string {
 	fatalIf(probe.NewError(err), "Unable to marshal into JSON.")
 
 	return string(logJSON)
-
 }
+
 func getLogTime(lt string) string {
 	tm, err := time.Parse(time.RFC3339Nano, lt)
 	if err != nil {
@@ -107,7 +107,7 @@ func getLogTime(lt string) string {
 // String - return colorized loginfo as string.
 func (l logMessage) String() string {
 	var hostStr string
-	var b = &strings.Builder{}
+	b := &strings.Builder{}
 	if l.NodeName != "" {
 		hostStr = fmt.Sprintf("%s ", colorizedNodeName(l.NodeName))
 	}

@@ -27,7 +27,7 @@ import (
 
 var adminUserSvcAcctDisableCmd = cli.Command{
 	Name:         "disable",
-	Usage:        "Disable a services account",
+	Usage:        "disable a service account",
 	Action:       mainAdminUserSvcAcctDisable,
 	OnUsageError: onUsageError,
 	Before:       setGlobalsFromContext,
@@ -42,7 +42,7 @@ FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}
 EXAMPLES:
-  1. Disable the service account 'J123C4ZXEQN8RK6ND35I' in MinIO server.
+  1. Disable a service account 'J123C4ZXEQN8RK6ND35I' on MinIO server.
      {{.Prompt}} {{.HelpName}} myminio/ J123C4ZXEQN8RK6ND35I
 `,
 }
@@ -50,8 +50,7 @@ EXAMPLES:
 // checkAdminUserSvcAcctDisableSyntax - validate all the passed arguments
 func checkAdminUserSvcAcctDisableSyntax(ctx *cli.Context) {
 	if len(ctx.Args()) != 2 {
-		fatalIf(errInvalidArgument().Trace(ctx.Args().Tail()...),
-			"Incorrect number of arguments for user svcacct disable command.")
+		cli.ShowCommandHelpAndExit(ctx, "disable", 1)
 	}
 }
 

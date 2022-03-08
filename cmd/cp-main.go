@@ -88,7 +88,7 @@ var (
 		},
 		cli.StringFlag{
 			Name:  "tags",
-			Usage: "apply tags to the uploaded objects",
+			Usage: "apply one or more tags to the uploaded objects",
 		},
 		cli.StringFlag{
 			Name:  rmFlag,
@@ -102,12 +102,18 @@ var (
 			Name:  lhFlag,
 			Usage: "apply legal hold to the copied object (on, off)",
 		},
+		cli.BoolFlag{
+			Name:  "zip",
+			Usage: "Extract from remote zip file (MinIO server source only)",
+		},
 	}
 )
 
-var rmFlag = "retention-mode"
-var rdFlag = "retention-duration"
-var lhFlag = "legal-hold"
+var (
+	rmFlag = "retention-mode"
+	rdFlag = "retention-duration"
+	lhFlag = "legal-hold"
+)
 
 // ErrInvalidMetadata reflects invalid metadata format
 var ErrInvalidMetadata = errors.New("specified metadata should be of form key1=value1;key2=value2;... and so on")
@@ -193,7 +199,7 @@ EXAMPLES:
       {{.Prompt}} {{.HelpName}} --rewind 10d -r play/mybucket/ /tmp/dest/
 
   20. Set tags to the uploaded objects
-      {{.Prompt}} {{.HelpName}} -r --tags "category=prod" ./data/ play/another-bucket/
+      {{.Prompt}} {{.HelpName}} -r --tags "category=prod&type=backup" ./data/ play/another-bucket/
 
 `,
 }
@@ -237,7 +243,7 @@ type ProgressReader interface {
 }
 
 // doCopy - Copy a single file from source to destination
-func doCopy(ctx context.Context, cpURLs URLs, pg ProgressReader, encKeyDB map[string][]prefixSSEPair, isMvCmd bool, preserve bool) URLs {
+func doCopy(ctx context.Context, cpURLs URLs, pg ProgressReader, encKeyDB map[string][]prefixSSEPair, isMvCmd bool, preserve, isZip bool) URLs {
 	if cpURLs.Error != nil {
 		cpURLs.Error = cpURLs.Error.Trace()
 		return cpURLs
@@ -263,7 +269,7 @@ func doCopy(ctx context.Context, cpURLs URLs, pg ProgressReader, encKeyDB map[st
 		})
 	}
 
-	urls := uploadSourceToTargetURL(ctx, cpURLs, pg, encKeyDB, preserve)
+	urls := uploadSourceToTargetURL(ctx, cpURLs, pg, encKeyDB, preserve, isZip)
 	if isMvCmd && urls.Error == nil {
 		rmManager.add(ctx, sourceAlias, sourceURL.String())
 	}
@@ -306,7 +312,18 @@ func doPrepareCopyURLs(ctx context.Context, session *sessionV8, cancelCopy conte
 		scanBar = scanBarFactory()
 	}
 
-	URLsCh := prepareCopyURLs(ctx, sourceURLs, targetURL, isRecursive, encKeyDB, olderThan, newerThan, parseRewindFlag(rewind), versionID)
+	opts := prepareCopyURLsOpts{
+		sourceURLs:  sourceURLs,
+		targetURL:   targetURL,
+		isRecursive: isRecursive,
+		encKeyDB:    encKeyDB,
+		olderThan:   olderThan,
+		newerThan:   newerThan,
+		timeRef:     parseRewindFlag(rewind),
+		versionID:   versionID,
+	}
+
+	URLsCh := prepareCopyURLs(ctx, opts)
 	done := false
 	for !done {
 		select {
@@ -328,7 +345,7 @@ func doPrepareCopyURLs(ctx context.Context, session *sessionV8, cancelCopy conte
 				break
 			}
 
-			var jsoniter = jsoniter.ConfigCompatibleWithStandardLibrary
+			jsoniter := jsoniter.ConfigCompatibleWithStandardLibrary
 			jsonData, e := jsoniter.Marshal(cpURLs)
 			if e != nil {
 				session.Delete()
@@ -363,7 +380,7 @@ func doCopySession(ctx context.Context, cancelCopy context.CancelFunc, cli *cli.
 	var isCopied func(string) bool
 	var totalObjects, totalBytes int64
 
-	var cpURLsCh = make(chan URLs, 10000)
+	cpURLsCh := make(chan URLs, 10000)
 
 	// Store a progress bar or an accounter
 	var pg ProgressReader
@@ -401,7 +418,7 @@ func doCopySession(ctx context.Context, cancelCopy context.CancelFunc, cli *cli.
 		pg.SetTotal(totalBytes)
 
 		go func() {
-			var jsoniter = jsoniter.ConfigCompatibleWithStandardLibrary
+			jsoniter := jsoniter.ConfigCompatibleWithStandardLibrary
 			// Prepare URL scanner from session data file.
 			urlScanner := bufio.NewScanner(session.NewDataReader())
 			for {
@@ -429,8 +446,18 @@ func doCopySession(ctx context.Context, cancelCopy context.CancelFunc, cli *cli.
 
 		go func() {
 			totalBytes := int64(0)
-			for cpURLs := range prepareCopyURLs(ctx, sourceURLs, targetURL, isRecursive,
-				encKeyDB, olderThan, newerThan, parseRewindFlag(rewind), versionID) {
+			opts := prepareCopyURLsOpts{
+				sourceURLs:  sourceURLs,
+				targetURL:   targetURL,
+				isRecursive: isRecursive,
+				encKeyDB:    encKeyDB,
+				olderThan:   olderThan,
+				newerThan:   newerThan,
+				timeRef:     parseRewindFlag(rewind),
+				versionID:   versionID,
+				isZip:       cli.Bool("zip"),
+			}
+			for cpURLs := range prepareCopyURLs(ctx, opts) {
 				if cpURLs.Error != nil {
 					// Print in new line and adjust to top so that we
 					// don't print over the ongoing scan bar
@@ -457,8 +484,8 @@ func doCopySession(ctx context.Context, cancelCopy context.CancelFunc, cli *cli.
 		}()
 	}
 
-	var quitCh = make(chan struct{})
-	var statusCh = make(chan URLs)
+	quitCh := make(chan struct{})
+	statusCh := make(chan URLs)
 
 	parallel := newParallelManager(statusCh)
 
@@ -513,6 +540,7 @@ func doCopySession(ctx context.Context, cancelCopy context.CancelFunc, cli *cli.
 				}
 
 				preserve := cli.Bool("preserve")
+				isZip := cli.Bool("zip")
 				if cli.String("attr") != "" {
 					userMetaMap, _ := getMetaDataEntry(cli.String("attr"))
 					for metadataKey, metaDataVal := range userMetaMap {
@@ -530,7 +558,7 @@ func doCopySession(ctx context.Context, cancelCopy context.CancelFunc, cli *cli.
 					}, 0)
 				} else {
 					parallel.queueTask(func() URLs {
-						return doCopy(ctx, cpURLs, pg, encKeyDB, isMvCmd, preserve)
+						return doCopy(ctx, cpURLs, pg, encKeyDB, isMvCmd, preserve, isZip)
 					}, cpURLs.SourceContent.Size)
 				}
 			}
@@ -639,7 +667,6 @@ func mainCopy(cliCtx *cli.Context) error {
 
 	// check 'copy' cli arguments.
 	checkCopySyntax(ctx, cliCtx, encKeyDB, false)
-
 	// Additional command specific theme customization.
 	console.SetColor("Copy", color.New(color.FgGreen, color.Bold))
 

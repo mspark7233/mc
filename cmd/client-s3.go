@@ -33,13 +33,14 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/minio/mc/pkg/httptracer"
 	"github.com/minio/mc/pkg/probe"
-	minio "github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/minio/minio-go/v7/pkg/lifecycle"
@@ -439,11 +440,13 @@ func (c *S3Client) ListNotificationConfigs(ctx context.Context, arn string) ([]N
 			continue
 		}
 		prefix, suffix := getFilters(config.Config)
-		configs = append(configs, NotificationConfig{ID: config.ID,
+		configs = append(configs, NotificationConfig{
+			ID:     config.ID,
 			Arn:    config.Topic,
 			Events: prettyEventNames(config.Events),
 			Prefix: prefix,
-			Suffix: suffix})
+			Suffix: suffix,
+		})
 	}
 
 	for _, config := range mb.QueueConfigs {
@@ -451,11 +454,13 @@ func (c *S3Client) ListNotificationConfigs(ctx context.Context, arn string) ([]N
 			continue
 		}
 		prefix, suffix := getFilters(config.Config)
-		configs = append(configs, NotificationConfig{ID: config.ID,
+		configs = append(configs, NotificationConfig{
+			ID:     config.ID,
 			Arn:    config.Queue,
 			Events: prettyEventNames(config.Events),
 			Prefix: prefix,
-			Suffix: suffix})
+			Suffix: suffix,
+		})
 	}
 
 	for _, config := range mb.LambdaConfigs {
@@ -463,11 +468,13 @@ func (c *S3Client) ListNotificationConfigs(ctx context.Context, arn string) ([]N
 			continue
 		}
 		prefix, suffix := getFilters(config.Config)
-		configs = append(configs, NotificationConfig{ID: config.ID,
+		configs = append(configs, NotificationConfig{
+			ID:     config.ID,
 			Arn:    config.Lambda,
 			Events: prettyEventNames(config.Events),
 			Prefix: prefix,
-			Suffix: suffix})
+			Suffix: suffix,
+		})
 	}
 
 	return configs, nil
@@ -645,7 +652,7 @@ func (c *S3Client) Select(ctx context.Context, expression string, sse encrypt.Se
 }
 
 func (c *S3Client) notificationToEventsInfo(ninfo notification.Info) []EventInfo {
-	var eventsInfo = make([]EventInfo, len(ninfo.Records))
+	eventsInfo := make([]EventInfo, len(ninfo.Records))
 	for i, record := range ninfo.Records {
 		bucketName := record.S3.Bucket.Name
 		var key string
@@ -776,26 +783,34 @@ func (c *S3Client) Watch(ctx context.Context, options WatchOptions) (*WatchObjec
 	}
 
 	go func() {
-		// Start listening on all bucket events.
-		for notificationInfo := range eventsCh {
-			if notificationInfo.Err != nil {
-				var perr *probe.Error
-				if minio.ToErrorResponse(notificationInfo.Err).Code == "NotImplemented" {
-					perr = probe.NewError(APINotImplemented{
-						API:     "Watch",
-						APIType: c.GetURL().String(),
-					})
-				} else {
-					perr = probe.NewError(notificationInfo.Err)
+		defer close(wo.EventInfoChan)
+		defer close(wo.ErrorChan)
+
+		for {
+			// Start listening on all bucket events.
+			select {
+			case notificationInfo, ok := <-eventsCh:
+				if !ok {
+					return
 				}
-				wo.Errors() <- perr
-			} else {
-				wo.Events() <- c.notificationToEventsInfo(notificationInfo)
+				if notificationInfo.Err != nil {
+					var perr *probe.Error
+					if minio.ToErrorResponse(notificationInfo.Err).Code == "NotImplemented" {
+						perr = probe.NewError(APINotImplemented{
+							API:     "Watch",
+							APIType: c.GetURL().String(),
+						})
+					} else {
+						perr = probe.NewError(notificationInfo.Err)
+					}
+					wo.Errors() <- perr
+				} else {
+					wo.Events() <- c.notificationToEventsInfo(notificationInfo)
+				}
+			case <-wo.DoneChan:
+				return
 			}
 		}
-
-		close(wo.EventInfoChan)
-		close(wo.ErrorChan)
 	}()
 
 	return wo, nil
@@ -804,12 +819,15 @@ func (c *S3Client) Watch(ctx context.Context, options WatchOptions) (*WatchObjec
 // Get - get object with GET options.
 func (c *S3Client) Get(ctx context.Context, opts GetOptions) (io.ReadCloser, *probe.Error) {
 	bucket, object := c.url2BucketAndObject()
+	o := minio.GetObjectOptions{
+		ServerSideEncryption: opts.SSE,
+		VersionID:            opts.VersionID,
+	}
+	if opts.Zip {
+		o.Set("x-minio-extract", "true")
+	}
 
-	reader, e := c.api.GetObject(ctx, bucket, object,
-		minio.GetObjectOptions{
-			ServerSideEncryption: opts.SSE,
-			VersionID:            opts.VersionID,
-		})
+	reader, e := c.api.GetObject(ctx, bucket, object, o)
 	if e != nil {
 		errResponse := minio.ToErrorResponse(e)
 		if errResponse.Code == "NoSuchBucket" {
@@ -1065,8 +1083,8 @@ func (c *S3Client) Put(ctx context.Context, reader io.Reader, size int64, progre
 }
 
 // Remove incomplete uploads.
-func (c *S3Client) removeIncompleteObjects(ctx context.Context, bucket string, objectsCh <-chan minio.ObjectInfo) <-chan minio.RemoveObjectError {
-	removeObjectErrorCh := make(chan minio.RemoveObjectError)
+func (c *S3Client) removeIncompleteObjects(ctx context.Context, bucket string, objectsCh <-chan minio.ObjectInfo) <-chan minio.RemoveObjectResult {
+	removeObjectErrorCh := make(chan minio.RemoveObjectResult)
 
 	// Goroutine reads from objectsCh and sends error to removeObjectErrorCh if any.
 	go func() {
@@ -1074,7 +1092,7 @@ func (c *S3Client) removeIncompleteObjects(ctx context.Context, bucket string, o
 
 		for info := range objectsCh {
 			if err := c.api.RemoveIncompleteUpload(ctx, bucket, info.Key); err != nil {
-				removeObjectErrorCh <- minio.RemoveObjectError{ObjectName: info.Key, Err: err}
+				removeObjectErrorCh <- minio.RemoveObjectResult{ObjectName: info.Key, Err: err}
 			}
 		}
 	}()
@@ -1087,32 +1105,45 @@ func (c *S3Client) AddUserAgent(app string, version string) {
 	c.api.SetAppInfo(app, version)
 }
 
+// RemoveResult returns the error or result of the removed objects.
+type RemoveResult struct {
+	minio.RemoveObjectResult
+	BucketName string
+	Err        *probe.Error
+}
+
 // Remove - remove object or bucket(s).
-func (c *S3Client) Remove(ctx context.Context, isIncomplete, isRemoveBucket, isBypass bool, contentCh <-chan *ClientContent) <-chan *probe.Error {
-	errorCh := make(chan *probe.Error)
+func (c *S3Client) Remove(ctx context.Context, isIncomplete, isRemoveBucket, isBypass bool, contentCh <-chan *ClientContent) <-chan RemoveResult {
+	resultCh := make(chan RemoveResult)
 
 	prevBucket := ""
 	// Maintain objectsCh, statusCh for each bucket
 	var objectsCh chan minio.ObjectInfo
-	var statusCh <-chan minio.RemoveObjectError
+	var statusCh <-chan minio.RemoveObjectResult
 	opts := minio.RemoveObjectsOptions{
 		GovernanceBypass: isBypass,
 	}
 
 	go func() {
-		defer close(errorCh)
-		if isRemoveBucket {
-			if _, object := c.url2BucketAndObject(); object != "" {
-				errorCh <- probe.NewError(errors.New(
+		defer close(resultCh)
+
+		_, object := c.url2BucketAndObject()
+		if isRemoveBucket && object != "" {
+			resultCh <- RemoveResult{
+				Err: probe.NewError(errors.New(
 					"use `mc rm` command to delete prefixes, or point your" +
-						" bucket directly, `mc rb <alias>/<bucket-name>/`"))
-				return
+						" bucket directly, `mc rb <alias>/<bucket-name>/`"),
+				),
 			}
+			return
 		}
+
 		for {
 			select {
 			case <-ctx.Done():
-				errorCh <- probe.NewError(ctx.Err())
+				resultCh <- RemoveResult{
+					Err: probe.NewError(ctx.Err()),
+				}
 				return
 			case content, ok := <-contentCh:
 				if !ok {
@@ -1136,7 +1167,7 @@ func (c *S3Client) Remove(ctx context.Context, isIncomplete, isRemoveBucket, isB
 					if isIncomplete {
 						statusCh = c.removeIncompleteObjects(ctx, bucket, objectsCh)
 					} else {
-						statusCh = c.api.RemoveObjects(ctx, bucket, objectsCh, opts)
+						statusCh = c.api.RemoveObjectsWithResult(ctx, bucket, objectsCh, opts)
 					}
 				}
 
@@ -1144,13 +1175,29 @@ func (c *S3Client) Remove(ctx context.Context, isIncomplete, isRemoveBucket, isB
 					if objectsCh != nil {
 						close(objectsCh)
 					}
+
 					for removeStatus := range statusCh {
-						errorCh <- probe.NewError(removeStatus.Err)
+						if removeStatus.Err != nil {
+							resultCh <- RemoveResult{
+								BucketName: bucket,
+								Err:        probe.NewError(removeStatus.Err),
+							}
+						} else {
+							resultCh <- RemoveResult{
+								BucketName:         bucket,
+								RemoveObjectResult: removeStatus,
+							}
+						}
 					}
+
 					// Remove bucket if it qualifies.
 					if isRemoveBucket && !isIncomplete {
 						if err := c.api.RemoveBucket(ctx, prevBucket); err != nil {
-							errorCh <- probe.NewError(err)
+							resultCh <- RemoveResult{
+								BucketName: bucket,
+								Err:        probe.NewError(err),
+							}
+							return
 						}
 					}
 					// Re-init objectsCh for next bucket
@@ -1158,7 +1205,7 @@ func (c *S3Client) Remove(ctx context.Context, isIncomplete, isRemoveBucket, isB
 					if isIncomplete {
 						statusCh = c.removeIncompleteObjects(ctx, bucket, objectsCh)
 					} else {
-						statusCh = c.api.RemoveObjects(ctx, bucket, objectsCh, opts)
+						statusCh = c.api.RemoveObjectsWithResult(ctx, bucket, objectsCh, opts)
 					}
 					prevBucket = bucket
 				}
@@ -1170,10 +1217,23 @@ func (c *S3Client) Remove(ctx context.Context, isIncomplete, isRemoveBucket, isB
 					sent := false
 					for !sent {
 						select {
-						case objectsCh <- minio.ObjectInfo{Key: objectName, VersionID: objectVersionID}:
+						case objectsCh <- minio.ObjectInfo{
+							Key:       objectName,
+							VersionID: objectVersionID,
+						}:
 							sent = true
 						case removeStatus := <-statusCh:
-							errorCh <- probe.NewError(removeStatus.Err)
+							if removeStatus.Err != nil {
+								resultCh <- RemoveResult{
+									BucketName: bucket,
+									Err:        probe.NewError(removeStatus.Err),
+								}
+							} else {
+								resultCh <- RemoveResult{
+									BucketName:         bucket,
+									RemoveObjectResult: removeStatus,
+								}
+							}
 						}
 					}
 				} else {
@@ -1191,28 +1251,42 @@ func (c *S3Client) Remove(ctx context.Context, isIncomplete, isRemoveBucket, isB
 		if objectsCh != nil {
 			close(objectsCh)
 		}
-		// Write remove objects status to errorCh
+		// Write remove objects status to resultCh
 		if statusCh != nil {
 			for removeStatus := range statusCh {
-				// If the removeStatus error message is:
-				// "Object is WORM protected and cannot be overwritten",
-				// it is too generic. We have the object's name and vid.
-				// Adding the object's name and version id into the error msg
-				removeStatus.Err = errors.New(strings.Replace(
-					removeStatus.Err.Error(), "Object is WORM protected",
-					"Object, '"+removeStatus.ObjectName+" (Version ID="+
-						removeStatus.VersionID+")' is WORM protected", 1))
-				errorCh <- probe.NewError(removeStatus.Err)
+				if removeStatus.Err != nil {
+					removeStatus.Err = errors.New(strings.Replace(
+						removeStatus.Err.Error(), "Object is WORM protected",
+						"Object, '"+removeStatus.ObjectName+" (Version ID="+
+							removeStatus.ObjectVersionID+")' is WORM protected", 1))
+
+					// If the removeStatus error message is:
+					// "Object is WORM protected and cannot be overwritten",
+					// it is too generic. We have the object's name and vid.
+					// Adding the object's name and version id into the error msg
+					resultCh <- RemoveResult{
+						Err: probe.NewError(removeStatus.Err),
+					}
+				} else {
+					resultCh <- RemoveResult{
+						BucketName:         prevBucket,
+						RemoveObjectResult: removeStatus,
+					}
+				}
 			}
 		}
 		// Remove last bucket if it qualifies.
 		if isRemoveBucket && prevBucket != "" && !isIncomplete {
 			if err := c.api.RemoveBucket(ctx, prevBucket); err != nil {
-				errorCh <- probe.NewError(err)
+				resultCh <- RemoveResult{
+					BucketName: prevBucket,
+					Err:        probe.NewError(err),
+				}
+				return
 			}
 		}
 	}()
-	return errorCh
+	return resultCh
 }
 
 // MakeBucket - make a new bucket.
@@ -1352,7 +1426,7 @@ func (c *S3Client) SetAccess(ctx context.Context, bucketPolicy string, isJSON bo
 	if e != nil {
 		return probe.NewError(e)
 	}
-	var p = policy.BucketAccessPolicy{Version: "2012-10-17"}
+	p := policy.BucketAccessPolicy{Version: "2012-10-17"}
 	if policyStr != "" {
 		if e = json.Unmarshal([]byte(policyStr), &p); e != nil {
 			return probe.NewError(e)
@@ -1376,7 +1450,7 @@ func (c *S3Client) SetAccess(ctx context.Context, bucketPolicy string, isJSON bo
 }
 
 // listObjectWrapper - select ObjectList mode depending on arguments
-func (c *S3Client) listObjectWrapper(ctx context.Context, bucket, object string, isRecursive bool, timeRef time.Time, withVersions, withDeleteMarkers bool, metadata bool, maxKeys int) <-chan minio.ObjectInfo {
+func (c *S3Client) listObjectWrapper(ctx context.Context, bucket, object string, isRecursive bool, timeRef time.Time, withVersions, withDeleteMarkers bool, metadata bool, maxKeys int, zip bool) <-chan minio.ObjectInfo {
 	if !timeRef.IsZero() || withVersions {
 		return c.listVersions(ctx, bucket, object, isRecursive, timeRef, withVersions, withDeleteMarkers)
 	}
@@ -1386,7 +1460,15 @@ func (c *S3Client) listObjectWrapper(ctx context.Context, bucket, object string,
 		// https://github.com/minio/mc/issues/3073
 		return c.api.ListObjects(ctx, bucket, minio.ListObjectsOptions{Prefix: object, Recursive: isRecursive, UseV1: true, MaxKeys: maxKeys})
 	}
-	return c.api.ListObjects(ctx, bucket, minio.ListObjectsOptions{Prefix: object, Recursive: isRecursive, WithMetadata: metadata, MaxKeys: maxKeys})
+	opts := minio.ListObjectsOptions{Prefix: object, Recursive: isRecursive, WithMetadata: metadata, MaxKeys: maxKeys}
+	if zip {
+		// If prefix ends with .zip, add a slash.
+		if strings.HasSuffix(object, ".zip") {
+			opts.Prefix = object + "/"
+		}
+		opts.Set("x-minio-extract", "true")
+	}
+	return c.api.ListObjects(ctx, bucket, opts)
 }
 
 func (c *S3Client) statIncompleteUpload(ctx context.Context, bucket, object string) (*ClientContent, *probe.Error) {
@@ -1401,15 +1483,17 @@ func (c *S3Client) statIncompleteUpload(ctx context.Context, bucket, object stri
 		}
 
 		if objectMultipartInfo.Key == object {
+			objectMetadata.BucketName = bucket
 			objectMetadata.URL = c.targetURL.Clone()
 			objectMetadata.Time = objectMultipartInfo.Initiated
 			objectMetadata.Size = objectMultipartInfo.Size
-			objectMetadata.Type = os.FileMode(0664)
+			objectMetadata.Type = os.FileMode(0o664)
 			objectMetadata.Metadata = map[string]string{}
 			return objectMetadata, nil
 		}
 
 		if strings.HasSuffix(objectMultipartInfo.Key, string(c.targetURL.Separator)) {
+			objectMetadata.BucketName = bucket
 			objectMetadata.URL = c.targetURL.Clone()
 			objectMetadata.Type = os.ModeDir
 			objectMetadata.Metadata = map[string]string{}
@@ -1430,9 +1514,11 @@ func (c *S3Client) Stat(ctx context.Context, opts StatOptions) (*ClientContent, 
 	if bucket == "" {
 		url := c.targetURL.Clone()
 		url.Path = string(c.targetURL.Separator)
-		return &ClientContent{URL: url,
-			Size: 0,
-			Type: os.ModeDir,
+		return &ClientContent{
+			URL:        url,
+			Size:       0,
+			Type:       os.ModeDir,
+			BucketName: bucket,
 		}, nil
 	}
 
@@ -1464,7 +1550,11 @@ func (c *S3Client) Stat(ctx context.Context, opts StatOptions) (*ClientContent, 
 	if !strings.HasSuffix(object, string(c.targetURL.Separator)) && opts.timeRef.IsZero() {
 		// Issue HEAD request first but ignore no such key error
 		// so we can check if there is such prefix which exists
-		ctnt, err := c.getObjectStat(ctx, bucket, object, minio.StatObjectOptions{ServerSideEncryption: opts.sse, VersionID: opts.versionID})
+		o := minio.StatObjectOptions{ServerSideEncryption: opts.sse, VersionID: opts.versionID}
+		if opts.isZip {
+			o.Set("x-minio-extract", "true")
+		}
+		ctnt, err := c.getObjectStat(ctx, bucket, object, o)
 		if err == nil {
 			return ctnt, nil
 		}
@@ -1479,7 +1569,7 @@ func (c *S3Client) Stat(ctx context.Context, opts StatOptions) (*ClientContent, 
 	// Prefix to pass to minio-go listing in order to fetch if a prefix exists
 	prefix := strings.TrimRight(object, string(c.targetURL.Separator))
 
-	for objectStat := range c.listObjectWrapper(ctx, bucket, prefix, nonRecursive, opts.timeRef, false, false, false, 1) {
+	for objectStat := range c.listObjectWrapper(ctx, bucket, prefix, nonRecursive, opts.timeRef, false, false, false, 1, opts.isZip) {
 		if objectStat.Err != nil {
 			return nil, probe.NewError(objectStat.Err)
 		}
@@ -1560,33 +1650,37 @@ func isVirtualHostStyle(host string, lookup minio.BucketLookupType) bool {
 	return isAmazon(host) && !isAmazonChina(host) || isGoogle(host) || isAmazonAccelerated(host)
 }
 
-// url2BucketAndObject gives bucketName and objectName from URL path.
-func (c *S3Client) url2BucketAndObject() (bucketName, objectName string) {
-	path := c.targetURL.Path
+func url2BucketAndObject(u *ClientURL, virtualStyle bool) (bucketName, objectName string) {
+	path := u.Path
 	// Convert any virtual host styled requests.
 	//
 	// For the time being this check is introduced for S3,
 	// If you have custom virtual styled hosts please.
 	// List them below.
-	if c.virtualStyle {
+	if virtualStyle {
 		var bucket string
-		hostIndex := strings.Index(c.targetURL.Host, "s3")
-		if hostIndex != -1 && !matchS3InHost(c.targetURL.Host) {
+		hostIndex := strings.Index(u.Host, "s3")
+		if hostIndex != -1 && !matchS3InHost(u.Host) {
 			hostIndex = -1
 		}
 		if hostIndex == -1 {
-			hostIndex = strings.Index(c.targetURL.Host, "s3-accelerate")
+			hostIndex = strings.Index(u.Host, "s3-accelerate")
 		}
 		if hostIndex == -1 {
-			hostIndex = strings.Index(c.targetURL.Host, "storage.googleapis")
+			hostIndex = strings.Index(u.Host, "storage.googleapis")
 		}
 		if hostIndex > 0 {
-			bucket = c.targetURL.Host[:hostIndex-1]
-			path = string(c.targetURL.Separator) + bucket + c.targetURL.Path
+			bucket = u.Host[:hostIndex-1]
+			path = string(u.Separator) + bucket + u.Path
 		}
 	}
-	tokens := splitStr(path, string(c.targetURL.Separator), 3)
+	tokens := splitStr(path, string(u.Separator), 3)
 	return tokens[1], tokens[2]
+}
+
+// url2BucketAndObject gives bucketName and objectName from URL path.
+func (c *S3Client) url2BucketAndObject() (bucketName, objectName string) {
+	return url2BucketAndObject(c.targetURL, c.virtualStyle)
 }
 
 // splitPath split path into bucket and object.
@@ -1708,7 +1802,9 @@ func (c *S3Client) versionedList(ctx context.Context, contentCh chan *ClientCont
 			}
 			return
 		}
-
+		if opts.Recursive {
+			sortBucketsNameWithSlash(buckets)
+		}
 		for _, bucket := range buckets {
 			if opts.ShowDir != DirLast {
 				contentCh <- c.bucketInfo2ClientContent(bucket)
@@ -1753,7 +1849,6 @@ func (c *S3Client) versionedList(ctx context.Context, contentCh chan *ClientCont
 
 noVersioning:
 	c.unversionedList(ctx, contentCh, opts)
-
 }
 
 // unversionedList is the non versioned S3 listing
@@ -1855,6 +1950,7 @@ func (c *S3Client) listIncompleteRecursiveInRoutine(ctx context.Context, content
 			}
 			return
 		}
+		sortBucketsNameWithSlash(buckets)
 		isRecursive := true
 		for _, bucket := range buckets {
 			if opts.ShowDir != DirLast {
@@ -1919,6 +2015,7 @@ func (c *S3Client) bucketInfo2ClientContent(bucket minio.BucketInfo) *ClientCont
 	url := c.targetURL.Clone()
 	url.Path = c.joinPath(bucket.Name)
 	content.URL = url
+	content.BucketName = bucket.Name
 	content.Size = 0
 	content.Time = bucket.CreationDate
 	content.Type = os.ModeDir
@@ -1935,6 +2032,7 @@ func (c *S3Client) objectInfo2ClientContent(bucket string, entry minio.ObjectInf
 	}
 	url.Path = c.joinPath(bucket, entry.Key)
 	content.URL = url
+	content.BucketName = bucket
 	content.Size = entry.Size
 	content.ETag = entry.ETag
 	content.Time = entry.LastModified
@@ -1976,7 +2074,7 @@ func (c *S3Client) objectInfo2ClientContent(bucket string, entry minio.ObjectInf
 			content.Time = time.Now()
 		}
 	} else {
-		content.Type = os.FileMode(0664)
+		content.Type = os.FileMode(0o664)
 	}
 
 	return content
@@ -1991,12 +2089,20 @@ func (c *S3Client) bucketStat(ctx context.Context, bucket string) (*ClientConten
 	if !exists {
 		return nil, probe.NewError(BucketDoesNotExist{Bucket: bucket})
 	}
-	return &ClientContent{URL: c.targetURL.Clone(), Time: time.Unix(0, 0), Type: os.ModeDir}, nil
+	return &ClientContent{
+		URL: c.targetURL.Clone(), BucketName: bucket, Time: time.Unix(0, 0), Type: os.ModeDir,
+	}, nil
 }
 
 func (c *S3Client) listInRoutine(ctx context.Context, contentCh chan *ClientContent, opts ListOptions) {
 	// get bucket and object from URL.
 	b, o := c.url2BucketAndObject()
+	if opts.ListZip && (b == "" || o == "") {
+		contentCh <- &ClientContent{
+			Err: probe.NewError(errors.New("listing zip files must provide bucket and object")),
+		}
+		return
+	}
 	switch {
 	case b == "" && o == "":
 		buckets, e := c.api.ListBuckets(ctx)
@@ -2018,7 +2124,7 @@ func (c *S3Client) listInRoutine(ctx context.Context, contentCh chan *ClientCont
 		contentCh <- content
 	default:
 		isRecursive := false
-		for object := range c.listObjectWrapper(ctx, b, o, isRecursive, time.Time{}, false, false, opts.WithMetadata, -1) {
+		for object := range c.listObjectWrapper(ctx, b, o, isRecursive, time.Time{}, false, false, opts.WithMetadata, -1, opts.ListZip) {
 			if object.Err != nil {
 				contentCh <- &ClientContent{
 					Err: probe.NewError(object.Err),
@@ -2049,6 +2155,15 @@ const (
 	s3StorageClassGlacier = "GLACIER"
 )
 
+// Sorting buckets name with an additional '/' to make sure that a
+// site-wide listing returns sorted output. This is crucial for
+// correct diff/mirror calculation.
+func sortBucketsNameWithSlash(bucketsInfo []minio.BucketInfo) {
+	sort.Slice(bucketsInfo, func(i, j int) bool {
+		return bucketsInfo[i].Name+"/" < bucketsInfo[j].Name+"/"
+	})
+}
+
 func (c *S3Client) listRecursiveInRoutine(ctx context.Context, contentCh chan *ClientContent, opts ListOptions) {
 	// get bucket and object from URL.
 	b, o := c.url2BucketAndObject()
@@ -2061,13 +2176,14 @@ func (c *S3Client) listRecursiveInRoutine(ctx context.Context, contentCh chan *C
 			}
 			return
 		}
+		sortBucketsNameWithSlash(buckets)
 		for _, bucket := range buckets {
 			if opts.ShowDir == DirFirst {
 				contentCh <- c.bucketInfo2ClientContent(bucket)
 			}
 
 			isRecursive := true
-			for object := range c.listObjectWrapper(ctx, bucket.Name, o, isRecursive, time.Time{}, false, false, opts.WithMetadata, -1) {
+			for object := range c.listObjectWrapper(ctx, bucket.Name, o, isRecursive, time.Time{}, false, false, opts.WithMetadata, -1, opts.ListZip) {
 				if object.Err != nil {
 					contentCh <- &ClientContent{
 						Err: probe.NewError(object.Err),
@@ -2083,7 +2199,7 @@ func (c *S3Client) listRecursiveInRoutine(ctx context.Context, contentCh chan *C
 		}
 	default:
 		isRecursive := true
-		for object := range c.listObjectWrapper(ctx, b, o, isRecursive, time.Time{}, false, false, opts.WithMetadata, -1) {
+		for object := range c.listObjectWrapper(ctx, b, o, isRecursive, time.Time{}, false, false, opts.WithMetadata, -1, opts.ListZip) {
 			if object.Err != nil {
 				contentCh <- &ClientContent{
 					Err: probe.NewError(object.Err),
@@ -2142,7 +2258,11 @@ func (c *S3Client) ShareUpload(ctx context.Context, isRecursive bool, expires ti
 
 // SetObjectLockConfig - Set object lock configurataion of bucket.
 func (c *S3Client) SetObjectLockConfig(ctx context.Context, mode minio.RetentionMode, validity uint64, unit minio.ValidityUnit) *probe.Error {
-	bucket, _ := c.url2BucketAndObject()
+	bucket, object := c.url2BucketAndObject()
+
+	if bucket == "" || object != "" {
+		return errInvalidArgument().Trace(bucket, object)
+	}
 
 	// FIXME: This is too ugly, fix minio-go
 	vuint := (uint)(validity)
@@ -2197,6 +2317,9 @@ func (c *S3Client) PutObjectRetention(ctx context.Context, versionID string, mod
 // GetObjectRetention - Get object retention for a given object.
 func (c *S3Client) GetObjectRetention(ctx context.Context, versionID string) (minio.RetentionMode, time.Time, *probe.Error) {
 	bucket, object := c.url2BucketAndObject()
+	if object == "" {
+		return "", time.Time{}, probe.NewError(ObjectNameEmpty{}).Trace(c.GetURL().String())
+	}
 	modePtr, untilPtr, e := c.api.GetObjectRetention(ctx, bucket, object, versionID)
 	if e != nil {
 		return "", time.Time{}, probe.NewError(e).Trace(c.GetURL().String())
@@ -2255,7 +2378,11 @@ func (c *S3Client) GetObjectLegalHold(ctx context.Context, versionID string) (mi
 
 // GetObjectLockConfig - Get object lock configuration of bucket.
 func (c *S3Client) GetObjectLockConfig(ctx context.Context) (string, minio.RetentionMode, uint64, minio.ValidityUnit, *probe.Error) {
-	bucket, _ := c.url2BucketAndObject()
+	bucket, object := c.url2BucketAndObject()
+
+	if bucket == "" || object != "" {
+		return "", "", 0, "", errInvalidArgument().Trace(bucket, object)
+	}
 
 	status, mode, validity, unit, e := c.api.GetObjectLockConfig(ctx, bucket)
 	if e != nil {
@@ -2491,6 +2618,20 @@ func (c *S3Client) ResetReplication(ctx context.Context, before time.Duration, t
 	}
 
 	rinfo, e := c.api.ResetBucketReplicationOnTarget(ctx, bucket, before, tgtArn)
+	if e != nil {
+		return rinfo, probe.NewError(e)
+	}
+	return rinfo, nil
+}
+
+// ReplicationResyncStatus - gets status of replication resync for this target arn
+func (c *S3Client) ReplicationResyncStatus(ctx context.Context, arn string) (rinfo replication.ResyncTargetsInfo, err *probe.Error) {
+	bucket, _ := c.url2BucketAndObject()
+	if bucket == "" {
+		return rinfo, probe.NewError(BucketNameEmpty{})
+	}
+
+	rinfo, e := c.api.GetBucketReplicationResyncStatus(ctx, bucket, arn)
 	if e != nil {
 		return rinfo, probe.NewError(e)
 	}

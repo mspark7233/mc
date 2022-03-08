@@ -33,25 +33,25 @@ import (
 	"time"
 
 	"github.com/cheggaaa/pb"
+	"github.com/inconshreveable/mousetrap"
 	"github.com/minio/cli"
 	"github.com/minio/mc/pkg/probe"
+	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/env"
 	"github.com/minio/pkg/trie"
 	"github.com/minio/pkg/words"
-	"github.com/pkg/profile"
 
 	completeinstall "github.com/posener/complete/cmd/install"
 )
 
-var (
-	// global flags for mc.
-	mcFlags = []cli.Flag{
-		cli.BoolFlag{
-			Name:  "autocompletion",
-			Usage: "install auto-completion for your shell",
-		},
-	}
-)
+// global flags for mc.
+var mcFlags = []cli.Flag{
+	cli.BoolFlag{
+		Name:  "autocompletion",
+		Usage: "install auto-completion for your shell",
+	},
+}
 
 // Help template for mc
 var mcHelpTemplate = `NAME:
@@ -76,9 +76,24 @@ VERSION:
   {{$value}}
 {{end}}`
 
+func init() {
+	if env.IsSet(mcEnvConfigFile) {
+		configFile := env.Get(mcEnvConfigFile, "")
+		fatalIf(readAliasesFromFile(configFile).Trace(configFile), "Unable to parse "+configFile)
+	}
+	if runtime.GOOS == "windows" {
+		if mousetrap.StartedByExplorer() {
+			fmt.Printf("Don't double-click %s\n", os.Args[0])
+			fmt.Println("You need to open cmd.exe/PowerShell and run it from the command line")
+			fmt.Println("Press the Enter Key to Exit")
+			fmt.Scanln()
+			os.Exit(1)
+		}
+	}
+}
+
 // Main starts mc application
 func Main(args []string) {
-
 	if len(args) > 1 {
 		switch args[1] {
 		case "mc", filepath.Base(args[0]):
@@ -87,15 +102,12 @@ func Main(args []string) {
 		}
 	}
 
-	// Enable profiling supported modes are [cpu, mem, block].
-	// ``MC_PROFILER`` supported options are [cpu, mem, block].
-	switch os.Getenv("MC_PROFILER") {
-	case "cpu":
-		defer profile.Start(profile.CPUProfile, profile.ProfilePath(mustGetProfileDir())).Stop()
-	case "mem":
-		defer profile.Start(profile.MemProfile, profile.ProfilePath(mustGetProfileDir())).Stop()
-	case "block":
-		defer profile.Start(profile.BlockProfile, profile.ProfilePath(mustGetProfileDir())).Stop()
+	// ``MC_PROFILER`` supported options are [cpu, mem, block, goroutine].
+	if p := os.Getenv("MC_PROFILER"); p != "" {
+		profilers := strings.Split(p, ",")
+		if e := enableProfilers(mustGetProfileDir(), profilers); e != nil {
+			console.Fatal(e)
+		}
 	}
 
 	probe.Init() // Set project's root source path.
@@ -135,7 +147,7 @@ func onUsageError(ctx *cli.Context, err error, subcommand bool) error {
 
 	// Calculate the maximum width of the flag name field
 	// for a good looking printing
-	var help = make([]subCommandHelp, len(ctx.Command.Flags))
+	help := make([]subCommandHelp, len(ctx.Command.Flags))
 	maxWidth := 0
 	for i, f := range ctx.Command.Flags {
 		s := strings.Split(f.String(), "\t")
@@ -169,7 +181,7 @@ func commandNotFound(ctx *cli.Context, cmds []cli.Command) {
 		return
 	}
 	msg := fmt.Sprintf("`%s` is not a recognized command. Get help using `--help` flag.", command)
-	var commandsTree = trie.NewTrie()
+	commandsTree := trie.NewTrie()
 	for _, cmd := range cmds {
 		commandsTree.Insert(cmd.Name)
 	}
@@ -282,7 +294,23 @@ func initMC() {
 
 	// Load all authority certificates present in CAs dir
 	loadRootCAs()
+}
 
+func getShellName() (string, bool) {
+	shellName := os.Getenv("SHELL")
+	if shellName != "" || runtime.GOOS == "windows" {
+		return strings.ToLower(filepath.Base(shellName)), true
+	}
+
+	ppid := os.Getppid()
+	cmd := exec.Command("ps", "-p", strconv.Itoa(ppid), "-o", "comm=")
+	ppName, err := cmd.Output()
+	if err != nil {
+		fatalIf(probe.NewError(err), "Failed to enable autocompletion. Cannot determine shell type and "+
+			"no SHELL environment variable found")
+	}
+	shellName = strings.TrimSpace(string(ppName))
+	return strings.ToLower(filepath.Base(shellName)), false
 }
 
 func installAutoCompletion() {
@@ -291,29 +319,15 @@ func installAutoCompletion() {
 		return
 	}
 
-	shellName := os.Getenv("SHELL")
-	if shellName == "" {
-		ppid := os.Getppid()
-		cmd := exec.Command("ps", "-p", strconv.Itoa(ppid), "-o", "comm=")
-		ppName, err := cmd.Output()
-		if err != nil {
-			fatalIf(probe.NewError(err), "Failed to enable autocompletion. Cannot determine shell type and"+
-				"no SHELL environment variable found")
-		}
-		shellName = strings.TrimSpace(string(ppName))
+	shellName, ok := getShellName()
+	if !ok {
 		console.Infoln("No 'SHELL' env var. Your shell is auto determined as '" + shellName + "'.")
 	} else {
 		console.Infoln("Your shell is set to '" + shellName + "', by env var 'SHELL'.")
 	}
-	shellName = strings.ToLower(filepath.Base(shellName))
 
-	supportedShells := map[string]bool{
-		"bash": true,
-		"zsh":  true,
-		"fish": true,
-	}
-
-	if !supportedShells[shellName] {
+	supportedShellsSet := set.CreateStringSet("bash", "zsh", "fish")
+	if !supportedShellsSet.Contains(shellName) {
 		fatalIf(probe.NewError(errors.New("")),
 			"'"+shellName+"' is not a supported shell. "+
 				"Supported shells are: bash, zsh, fish")
@@ -408,21 +422,21 @@ var appCmds = []cli.Command{
 	mbCmd,
 	rbCmd,
 	cpCmd,
+	mvCmd,
+	rmCmd,
 	mirrorCmd,
 	catCmd,
 	headCmd,
 	pipeCmd,
-	shareCmd,
 	findCmd,
 	sqlCmd,
 	statCmd,
-	mvCmd,
 	treeCmd,
 	duCmd,
 	retentionCmd,
 	legalHoldCmd,
-	diffCmd,
-	rmCmd,
+	supportCmd,
+	shareCmd,
 	versionCmd,
 	ilmCmd,
 	encryptCmd,
@@ -432,6 +446,7 @@ var appCmds = []cli.Command{
 	anonymousCmd,
 	policyCmd,
 	tagCmd,
+	diffCmd,
 	replicateCmd,
 	adminCmd,
 	configCmd,

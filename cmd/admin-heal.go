@@ -69,6 +69,10 @@ var adminHealFlags = []cli.Flag{
 		Name:  "storage-class",
 		Usage: "show server/disks failure tolerance with the given storage class",
 	},
+	cli.BoolFlag{
+		Name:  "verbose, v",
+		Usage: "show verbose information",
+	},
 }
 
 var adminHealCmd = cli.Command{
@@ -91,9 +95,6 @@ FLAGS:
 EXAMPLES:
   1. Monitor healing status on a running server at alias 'myminio':
      {{.Prompt}} {{.HelpName}} myminio/
-     Objects Healed: 7/27 (25.9%), 31 MB/110 MB (0%)
-     Heal rate: 3 obj/s, 10 MB/s
-     Estimated Completion: 11 seconds
 `,
 }
 
@@ -129,15 +130,6 @@ func (s stopHealMessage) JSON() string {
 	return string(stopHealJSONBytes)
 }
 
-// verboseBackgroundHealStatusMessage is container for stop heal success and failure messages.
-type verboseBackgroundHealStatusMessage struct {
-	Status   string `json:"status"`
-	HealInfo madmin.BgHealState
-
-	// Specify storage class to show servers/disks tolerance
-	ToleranceForSC string `json:"-"`
-}
-
 type setIndex struct {
 	pool, set int
 }
@@ -150,13 +142,12 @@ type healingStatus struct {
 
 // Estimation of when the healing will finish
 func (h healingStatus) ETA() time.Time {
-	if h.started.IsZero() {
-		return time.Time{}
+	if !h.started.IsZero() && h.totalObjects > h.totalHealed {
+		objScanSpeed := float64(time.Now().UTC().Sub(h.started)) / float64(h.totalHealed)
+		remainingDuration := float64(h.totalObjects-h.totalHealed) * objScanSpeed
+		return time.Now().UTC().Add(time.Duration(remainingDuration))
 	}
-
-	objScanSpeed := float64(time.Since(h.started)) / float64(h.totalHealed)
-	remainingDuration := float64(h.totalObjects-h.totalHealed) * objScanSpeed
-	return time.Now().Add(time.Duration(remainingDuration))
+	return time.Time{}
 }
 
 type poolInfo struct {
@@ -216,6 +207,7 @@ func getPoolsIndexes(disks []madmin.Disk) []int {
 	for pool := range m {
 		pools = append(pools, pool)
 	}
+	sort.Ints(pools)
 	return pools
 }
 
@@ -252,7 +244,7 @@ func generateServersStatus(disks []madmin.Disk) map[string]serverInfo {
 		}
 		endpoint := u.Host
 		if endpoint == "" {
-			endpoint = "localhost"
+			endpoint = "local-pool" + humanize.Ordinal(d.PoolIndex+1)
 		}
 		serverSt, ok := m[endpoint]
 		if !ok {
@@ -343,47 +335,52 @@ func getOfflineNodes(endpoints []string) map[string]struct{} {
 	return offlineNodes
 }
 
+// verboseBackgroundHealStatusMessage is container for stop heal success and failure messages.
+type verboseBackgroundHealStatusMessage struct {
+	Status   string `json:"status"`
+	HealInfo madmin.BgHealState
+
+	// Specify storage class to show servers/disks tolerance
+	ToleranceForSC string `json:"-"`
+}
+
 // String colorized to show background heal status message.
 func (s verboseBackgroundHealStatusMessage) String() string {
 	var msg strings.Builder
 
 	parity, showTolerance := s.HealInfo.SCParity[s.ToleranceForSC]
-
 	offlineEndpoints := getOfflineNodes(s.HealInfo.OfflineEndpoints)
-
 	allDisks := getAllDisks(s.HealInfo.Sets)
 	pools := getPoolsIndexes(allDisks)
 	setsStatus := generateSetsStatus(allDisks)
 	serversStatus := generateServersStatus(allDisks)
 
-	var poolsTolerance = make(map[int]poolInfo)
+	poolsInfo := make(map[int]poolInfo)
 	for _, pool := range pools {
 		tolerance := computePoolTolerance(pool, parity, setsStatus, serversStatus)
 		endpoints := computePoolEndpoints(pool, serversStatus)
-		poolsTolerance[pool] = poolInfo{tolerance: tolerance, endpoints: endpoints}
+		poolsInfo[pool] = poolInfo{tolerance: tolerance, endpoints: endpoints}
 	}
-
-	// Sort endpoints by name
-	var orderedEndpoints []string
-	for endpoint := range serversStatus {
-		orderedEndpoints = append(orderedEndpoints, endpoint)
-	}
-	sort.Strings(orderedEndpoints)
 
 	distributed := len(serversStatus) > 1
 
-	var plural = ""
+	plural := ""
 	if distributed {
 		plural = "s"
 	}
 	fmt.Fprintf(&msg, "Server%s status:\n", plural)
 	fmt.Fprintf(&msg, "==============\n")
 
-	sort.Ints(pools)
 	for _, pool := range pools {
-		fmt.Fprintf(&msg, "Pool %d:\n", pool+1)
+		fmt.Fprintf(&msg, "Pool %s:\n", humanize.Ordinal(pool+1))
+
+		// Sort servers in this pool by name
+		orderedEndpoints := make([]string, len(poolsInfo[pool].endpoints))
+		copy(orderedEndpoints, poolsInfo[pool].endpoints)
+		sort.Strings(orderedEndpoints)
 
 		for _, endpoint := range orderedEndpoints {
+			// Print offline status if node is offline
 			_, ok := offlineEndpoints[endpoint]
 			if ok {
 				stateText := console.Colorize("NodeFailed", "OFFLINE")
@@ -394,7 +391,7 @@ func (s verboseBackgroundHealStatusMessage) String() string {
 			switch {
 			case showTolerance:
 				serverHeader := "  %s: (Tolerance: %d server(s))\n"
-				fmt.Fprintf(&msg, fmt.Sprintf(serverHeader, endpoint, poolsTolerance[serverStatus.pool].tolerance))
+				fmt.Fprintf(&msg, fmt.Sprintf(serverHeader, endpoint, poolsInfo[serverStatus.pool].tolerance))
 			default:
 				serverHeader := "  %s:\n"
 				fmt.Fprintf(&msg, fmt.Sprintf(serverHeader, endpoint))
@@ -417,7 +414,7 @@ func (s verboseBackgroundHealStatusMessage) String() string {
 				if d.healing {
 					estimationText := "Calculating..."
 					if eta := setsStatus[d.set].healingStatus.ETA(); !eta.IsZero() {
-						estimationText = humanize.RelTime(time.Now(), eta, "", "")
+						estimationText = humanize.RelTime(time.Now().UTC(), eta, "", "")
 					}
 					fmt.Fprintf(&msg, "  |__ Estimated: %s\n", estimationText)
 				}
@@ -431,13 +428,12 @@ func (s verboseBackgroundHealStatusMessage) String() string {
 		}
 	}
 
-	fmt.Fprintf(&msg, "\n")
-
-	if showTolerance && distributed {
+	if showTolerance {
+		fmt.Fprintf(&msg, "\n")
 		fmt.Fprintf(&msg, "Server Failure Tolerance:\n")
 		fmt.Fprintf(&msg, "========================\n")
-		for _, pool := range poolsTolerance {
-			fmt.Fprintf(&msg, "Pool 1:\n")
+		for i, pool := range poolsInfo {
+			fmt.Fprintf(&msg, "Pool %s:\n", humanize.Ordinal(i+1))
 			fmt.Fprintf(&msg, "   Tolerance : %d server(s)\n", pool.tolerance)
 			fmt.Fprintf(&msg, "       Nodes :")
 			for _, endpoint := range pool.endpoints {
@@ -447,12 +443,12 @@ func (s verboseBackgroundHealStatusMessage) String() string {
 		}
 	}
 
-	summry := shortBackgroundHealStatusMessage{HealInfo: s.HealInfo}
+	summary := shortBackgroundHealStatusMessage{HealInfo: s.HealInfo}
 
 	fmt.Fprintf(&msg, "\n")
 	fmt.Fprintf(&msg, "Summary:\n")
 	fmt.Fprintf(&msg, "=======\n")
-	fmt.Fprintf(&msg, summry.String())
+	fmt.Fprintf(&msg, summary.String())
 	fmt.Fprintf(&msg, "\n")
 
 	return msg.String()
@@ -537,8 +533,8 @@ func (s shortBackgroundHealStatusMessage) String() string {
 		}
 	}
 
-	if startedAt.IsZero() {
-		healPrettyMsg += "No ongoing active healing."
+	if startedAt.IsZero() && itemsHealed == 0 {
+		healPrettyMsg += "No active healing in progress."
 		return healPrettyMsg
 	}
 
@@ -554,11 +550,13 @@ func (s shortBackgroundHealStatusMessage) String() string {
 		healPrettyMsg += fmt.Sprintf("Objects Healed: %s, %s\n", humanize.Comma(int64(itemsHealed)), humanize.Bytes(bytesHealed))
 	}
 
-	bytesHealedPerSec := float64(uint64(time.Second)*bytesHealed) / float64(accumulatedElapsedTime)
-	itemsHealedPerSec := float64(uint64(time.Second)*itemsHealed) / float64(accumulatedElapsedTime)
-	healPrettyMsg += fmt.Sprintf("Heal rate: %d obj/s, %s/s\n", int64(itemsHealedPerSec), humanize.IBytes(uint64(bytesHealedPerSec)))
+	if accumulatedElapsedTime > 0 {
+		bytesHealedPerSec := float64(uint64(time.Second)*bytesHealed) / float64(accumulatedElapsedTime)
+		itemsHealedPerSec := float64(uint64(time.Second)*itemsHealed) / float64(accumulatedElapsedTime)
+		healPrettyMsg += fmt.Sprintf("Heal rate: %d obj/s, %s/s\n", int64(itemsHealedPerSec), humanize.IBytes(uint64(bytesHealedPerSec)))
+	}
 
-	if totalItems > 0 && totalBytes > 0 {
+	if totalItems > 0 && totalBytes > 0 && !startedAt.IsZero() {
 		// Estimation completion
 		avgTimePerObject := float64(accumulatedElapsedTime) / float64(itemsHealed)
 		estimatedDuration := time.Duration(avgTimePerObject * float64(totalItems))
@@ -587,7 +585,6 @@ func transformScanArg(scanArg string) madmin.HealScanMode {
 
 // mainAdminHeal - the entry function of heal command
 func mainAdminHeal(ctx *cli.Context) error {
-
 	// Check for command syntax
 	checkAdminHealSyntax(ctx)
 
@@ -630,11 +627,18 @@ func mainAdminHeal(ctx *cli.Context) error {
 	if bucket == "" && !ctx.Bool("recursive") {
 		bgHealStatus, berr := adminClnt.BackgroundHealStatus(globalContext)
 		fatalIf(probe.NewError(berr), "Failed to get the status of the background heal.")
-		printMsg(verboseBackgroundHealStatusMessage{
-			Status:         "success",
-			HealInfo:       bgHealStatus,
-			ToleranceForSC: strings.ToUpper(ctx.String("storage-class")),
-		})
+		if ctx.Bool("verbose") {
+			printMsg(verboseBackgroundHealStatusMessage{
+				Status:         "success",
+				HealInfo:       bgHealStatus,
+				ToleranceForSC: strings.ToUpper(ctx.String("storage-class")),
+			})
+		} else {
+			printMsg(shortBackgroundHealStatusMessage{
+				Status:   "success",
+				HealInfo: bgHealStatus,
+			})
+		}
 		return nil
 	}
 

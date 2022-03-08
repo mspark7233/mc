@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"strings"
@@ -28,6 +29,7 @@ import (
 	"github.com/minio/madmin-go"
 	"github.com/minio/mc/pkg/probe"
 	"github.com/minio/pkg/console"
+	iampolicy "github.com/minio/pkg/iam/policy"
 )
 
 var adminUserSvcAcctAddFlags = []cli.Flag{
@@ -73,22 +75,21 @@ EXAMPLES:
 // checkAdminUserSvcAcctAddSyntax - validate all the passed arguments
 func checkAdminUserSvcAcctAddSyntax(ctx *cli.Context) {
 	if len(ctx.Args()) != 2 {
-		fatalIf(errInvalidArgument().Trace(ctx.Args().Tail()...),
-			"Incorrect number of arguments for user svcacct add command.")
+		cli.ShowCommandHelpAndExit(ctx, "add", 1)
 	}
 }
 
 // svcAcctMessage container for content message structure
 type svcAcctMessage struct {
 	op            string
-	Status        string   `json:"status"`
-	AccessKey     string   `json:"accessKey,omitempty"`
-	SecretKey     string   `json:"secretKey,omitempty"`
-	ParentUser    string   `json:"parentUser,omitempty"`
-	ImpliedPolicy bool     `json:"impliedPolicy,omitempty"`
-	Policy        string   `json:"policy,omitempty"`
-	AccountStatus string   `json:"accountStatus,omitempty"`
-	MemberOf      []string `json:"memberOf,omitempty"`
+	Status        string          `json:"status"`
+	AccessKey     string          `json:"accessKey,omitempty"`
+	SecretKey     string          `json:"secretKey,omitempty"`
+	ParentUser    string          `json:"parentUser,omitempty"`
+	ImpliedPolicy bool            `json:"impliedPolicy,omitempty"`
+	Policy        json.RawMessage `json:"policy,omitempty"`
+	AccountStatus string          `json:"accountStatus,omitempty"`
+	MemberOf      []string        `json:"memberOf,omitempty"`
 }
 
 const (
@@ -158,15 +159,21 @@ func mainAdminUserSvcAcctAdd(ctx *cli.Context) error {
 	client, err := newAdminClient(aliasedURL)
 	fatalIf(err, "Unable to initialize admin connection.")
 
-	var buf []byte
+	var policyBytes []byte
 	if policyPath != "" {
+		// Validate the policy document and ensure it has at least when statement
 		var e error
-		buf, e = ioutil.ReadFile(policyPath)
+		policyBytes, e = ioutil.ReadFile(policyPath)
 		fatalIf(probe.NewError(e), "Unable to open the policy document.")
+		p, e := iampolicy.ParseConfig(bytes.NewReader(policyBytes))
+		fatalIf(probe.NewError(e), "Unable to parse the policy document.")
+		if p.IsEmpty() {
+			fatalIf(errInvalidArgument(), "Empty policy documents are not allowed.")
+		}
 	}
 
 	opts := madmin.AddServiceAccountReq{
-		Policy:     buf,
+		Policy:     policyBytes,
 		AccessKey:  accessKey,
 		SecretKey:  secretKey,
 		TargetUser: user,

@@ -20,23 +20,22 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"encoding/base64"
-	"encoding/json"
-
 	"github.com/minio/cli"
 	"github.com/minio/madmin-go"
 	"github.com/minio/mc/pkg/probe"
-	"github.com/minio/pkg/licverifier"
 	"github.com/tidwall/gjson"
 	"golang.org/x/crypto/ssh/terminal"
 )
@@ -50,10 +49,6 @@ var subnetCommonFlags = []cli.Flag{
 	cli.StringFlag{
 		Name:  "name",
 		Usage: "Specify the name to associate to this MinIO cluster in SUBNET",
-	},
-	cli.StringFlag{
-		Name:  "subnet-proxy",
-		Usage: "Specify the HTTP(S) proxy URL to use for connecting to SUBNET",
 	},
 	cli.BoolFlag{
 		Name:  "airgap",
@@ -80,6 +75,10 @@ func subnetBaseURL() string {
 	return "https://subnet.min.io"
 }
 
+func subnetLogWebhookURL() string {
+	return subnetBaseURL() + "/api/logs"
+}
+
 func subnetHealthUploadURL() string {
 	return subnetBaseURL() + "/api/health/upload"
 }
@@ -100,22 +99,33 @@ func subnetMFAURL() string {
 	return subnetBaseURL() + "/api/auth/mfa-login"
 }
 
-func urlReachable(url string) bool {
-	r, e := http.Head(url)
-	return e == nil && r.StatusCode == http.StatusOK
+func checkURLReachable(url string) *probe.Error {
+	clnt := httpClient(10 * time.Second)
+	req, e := http.NewRequest(http.MethodHead, url, nil)
+	if e != nil {
+		return probe.NewError(e).Trace(url)
+	}
+	resp, e := clnt.Do(req)
+	if e != nil {
+		return probe.NewError(e).Trace(url)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return probe.NewError(errors.New(resp.Status)).Trace(url)
+	}
+	return nil
 }
 
-func subnetReachable() bool {
-	return urlReachable(subnetBaseURL())
-}
-
-func subnetURLWithAuth(reqURL string, license string) (string, map[string]string, error) {
+func subnetURLWithAuth(reqURL string, apiKey string, license string) (string, map[string]string, error) {
 	headers := map[string]string{}
-	if len(license) > 0 {
+	if len(apiKey) > 0 {
+		// Add api key in url for authentication
+		reqURL = reqURL + "?api_key=" + apiKey
+	} else if len(license) > 0 {
 		// Add license in url for authentication
 		reqURL = reqURL + "?license=" + license
 	} else {
-		// License not available in minio/mc config.
+		// API key not available in minio/mc config.
 		// Ask the user to log in to get auth token
 		token, e := subnetLogin()
 		if e != nil {
@@ -137,7 +147,7 @@ func subnetAuthHeaders(authToken string) map[string]string {
 	return map[string]string{"Authorization": "Bearer " + authToken}
 }
 
-func execReq(req *http.Request) (*http.Response, error) {
+func httpDo(req *http.Request) (*http.Response, error) {
 	client := httpClient(10 * time.Second)
 	if globalSubnetProxyURL != nil {
 		client.Transport.(*http.Transport).Proxy = http.ProxyURL(globalSubnetProxyURL)
@@ -145,7 +155,7 @@ func execReq(req *http.Request) (*http.Response, error) {
 	return client.Do(req)
 }
 
-func subnetExecReq(r *http.Request, headers map[string]string) (string, error) {
+func subnetReqDo(r *http.Request, headers map[string]string) (string, error) {
 	for k, v := range headers {
 		r.Header.Add(k, v)
 	}
@@ -155,7 +165,7 @@ func subnetExecReq(r *http.Request, headers map[string]string) (string, error) {
 		r.Header.Add("Content-Type", "application/json")
 	}
 
-	resp, e := execReq(r)
+	resp, e := httpDo(r)
 	if e != nil {
 		return "", e
 	}
@@ -174,39 +184,86 @@ func subnetExecReq(r *http.Request, headers map[string]string) (string, error) {
 }
 
 func subnetGetReq(reqURL string, headers map[string]string) (string, error) {
-	r, _ := http.NewRequest("GET", reqURL, nil)
-	return subnetExecReq(r, headers)
-}
-
-func subnetPostReq(reqURL string, payload interface{}, headers map[string]string) (string, error) {
-	body, _ := json.Marshal(payload)
-	r, e := http.NewRequest("POST", reqURL, bytes.NewBuffer(body))
+	r, e := http.NewRequest(http.MethodGet, reqURL, nil)
 	if e != nil {
 		return "", e
 	}
-	return subnetExecReq(r, headers)
+	return subnetReqDo(r, headers)
 }
 
-func getSubnetLicenseFromConfig(alias string) string {
+func subnetPostReq(reqURL string, payload interface{}, headers map[string]string) (string, error) {
+	body, e := json.Marshal(payload)
+	if e != nil {
+		return "", e
+	}
+	r, e := http.NewRequest(http.MethodPost, reqURL, bytes.NewReader(body))
+	if e != nil {
+		return "", e
+	}
+	return subnetReqDo(r, headers)
+}
+
+func getSubSysKeyFromMinIOConfig(client *madmin.AdminClient, subSys string) madmin.KVS {
+	sh, pe := client.HelpConfigKV(globalContext, subSys, "", false)
+	fatalIf(probe.NewError(pe), fmt.Sprintf("Unable to get config keys for %s", subSys))
+
+	buf, e := client.GetConfigKV(globalContext, subSys)
+	fatalIf(probe.NewError(e), fmt.Sprintf("Unable to get server config for %s", subSys))
+
+	tgt, e := madmin.ParseSubSysTarget(buf, sh)
+	fatalIf(probe.NewError(e), fmt.Sprintf("Unable to parse sub-system target '%s'", subSys))
+
+	return tgt.KVS
+}
+
+func getSubnetKeyFromMinIOConfig(alias string, key string) (string, bool) {
 	client, err := newAdminClient(alias)
 	fatalIf(err, "Unable to initialize admin connection.")
 
-	if minioConfigSupportsLicense(client) {
-		sh, pe := client.HelpConfigKV(globalContext, "subnet", "license", false)
-		fatalIf(probe.NewError(pe), "Unable to get config keys for SUBNET")
-
-		buf, e := client.GetConfigKV(globalContext, "subnet")
-		fatalIf(probe.NewError(e), "Unable to get server SUBNET config")
-
-		tgt, e := madmin.ParseSubSysTarget(buf, sh)
-		fatalIf(probe.NewError(e), "Unable to parse sub-system target 'subnet'")
-
-		lic := tgt.KVS.Get("license")
-		if len(lic) > 0 {
-			return lic
-		}
+	if minioConfigSupportsSubnet(client) {
+		return getSubSysKeyFromMinIOConfig(client, "subnet").Lookup(key)
 	}
 
+	return "", false
+}
+
+func getSubnetAPIKeyFromConfig(alias string) string {
+	// get the subnet api_key config from MinIO if available
+	apiKey, supported := getSubnetKeyFromMinIOConfig(alias, "api_key")
+	if supported {
+		return apiKey
+	}
+
+	// otherwise get it from mc config
+	return mcConfig().Aliases[alias].APIKey
+}
+
+func setSubnetProxyFromConfig(alias string) error {
+	if globalSubnetProxyURL != nil {
+		// proxy already set
+		return nil
+	}
+
+	// get the subnet proxy config from MinIO if available
+	proxy, supported := getSubnetKeyFromMinIOConfig(alias, "proxy")
+	if supported && len(proxy) > 0 {
+		proxyURL, e := url.Parse(proxy)
+		if e != nil {
+			return e
+		}
+		globalSubnetProxyURL = proxyURL
+	}
+	return nil
+}
+
+func getSubnetLicenseFromConfig(alias string) string {
+	// get the subnet license config from MinIO if available
+	lic, supported := getSubnetKeyFromMinIOConfig(alias, "license")
+	if supported {
+		return lic
+	}
+
+	// otherwise get it from mc config
 	return mcConfig().Aliases[alias].License
 }
 
@@ -217,7 +274,7 @@ func mcConfig() *configV10 {
 	return config
 }
 
-func minioConfigSupportsLicense(client *madmin.AdminClient) bool {
+func minioConfigSupportsSubnet(client *madmin.AdminClient) bool {
 	help, e := client.HelpConfigKV(globalContext, "", "", false)
 	fatalIf(probe.NewError(e), "Unable to get minio config keys")
 
@@ -230,20 +287,21 @@ func minioConfigSupportsLicense(client *madmin.AdminClient) bool {
 	return false
 }
 
-func setSubnetLicenseConfig(alias string, lic string) {
-	// Create a new MinIO Admin Client
-	client, err := newAdminClient(alias)
-	fatalIf(err, "Unable to initialize admin connection.")
+func setSubnetAPIKeyConfig(alias string, apiKey string) {
+	_, supported := getSubnetKeyFromMinIOConfig(alias, "api_key")
+	if supported {
+		// Create a new MinIO Admin Client
+		client, err := newAdminClient(alias)
+		fatalIf(err, "Unable to initialize admin connection.")
 
-	if minioConfigSupportsLicense(client) {
-		configStr := "subnet license=" + lic
+		configStr := "subnet license= api_key=" + apiKey
 		_, e := client.SetConfigKV(globalContext, configStr)
-		fatalIf(probe.NewError(e), "Unable to set SUBNET license config on minio")
+		fatalIf(probe.NewError(e), "Unable to set SUBNET API key config on minio")
 		return
 	}
 	mcCfg := mcConfig()
 	aliasCfg := mcCfg.Aliases[alias]
-	aliasCfg.License = lic
+	aliasCfg.APIKey = apiKey
 	setAlias(alias, aliasCfg)
 }
 
@@ -301,7 +359,7 @@ func subnetLogin() (string, error) {
 	reader := bufio.NewReader(os.Stdin)
 	fmt.Print("SUBNET username: ")
 	username, _ := reader.ReadString('\n')
-	username = strings.Trim(username, "\n")
+	username = strings.TrimSpace(username)
 
 	if len(username) == 0 {
 		return "", errors.New("Username cannot be empty. If you don't have one, please create one from here: " + minioSubscriptionURL)
@@ -372,9 +430,19 @@ func getSubnetAccID(headers map[string]string) (string, error) {
 
 // registerClusterOnSubnet - Registers the given cluster on SUBNET
 func registerClusterOnSubnet(alias string, clusterRegInfo ClusterRegistrationInfo) (string, error) {
-	lic := getSubnetLicenseFromConfig(alias)
+	e := setSubnetProxyFromConfig(alias)
+	if e != nil {
+		return "", e
+	}
 
-	regURL, headers, e := subnetURLWithAuth(subnetRegisterURL(), lic)
+	apiKey := getSubnetAPIKeyFromConfig(alias)
+
+	lic := ""
+	if len(apiKey) == 0 {
+		lic = getSubnetLicenseFromConfig(alias)
+	}
+
+	regURL, headers, e := subnetURLWithAuth(subnetRegisterURL(), apiKey, lic)
 	if e != nil {
 		return "", e
 	}
@@ -388,33 +456,10 @@ func registerClusterOnSubnet(alias string, clusterRegInfo ClusterRegistrationInf
 	return subnetPostReq(regURL, reqPayload, headers)
 }
 
-func verifySubnetLicense(lic string) error {
-	var pemBytes []byte
-	if globalDevMode {
-		pemBytes = []byte(`-----BEGIN PUBLIC KEY-----
-MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEbo+e1wpBY4tBq9AONKww3Kq7m6QP/TBQ
-mr/cKCUyBL7rcAvg0zNq1vcSrUSGlAmY3SEDCu3GOKnjG/U4E7+p957ocWSV+mQU
-9NKlTdQFGF3+aO6jbQ4hX/S5qPyF+a3z
------END PUBLIC KEY-----`)
-	} else {
-		pemBytes = []byte(`-----BEGIN PUBLIC KEY-----
-MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAEaK31xujr6/rZ7ZfXZh3SlwovjC+X8wGq
-qkltaKyTLRENd4w3IRktYYCRgzpDLPn/nrf7snV/ERO5qcI7fkEES34IVEr+2Uff
-JkO2PfyyAYEO/5dBlPh1Undu9WQl6J7B
------END PUBLIC KEY-----`)
+// extractAndSaveAPIKey - extract api key from response and set it in minio config
+func extractAndSaveAPIKey(alias string, resp string) {
+	subnetAPIKey := gjson.Parse(resp).Get("api_key").String()
+	if len(subnetAPIKey) > 0 {
+		setSubnetAPIKeyConfig(alias, subnetAPIKey)
 	}
-	lv, e := licverifier.NewLicenseVerifier(pemBytes)
-	if e != nil {
-		return e
-	}
-	_, e = lv.Verify(lic)
-	return e
-}
-
-func subnetNotReachableMsg() string {
-	errMsg := "https://subnet.min.io is not reachable"
-	if globalSubnetProxyURL != nil {
-		errMsg += " using proxy " + globalSubnetProxyURL.String()
-	}
-	return errMsg
 }

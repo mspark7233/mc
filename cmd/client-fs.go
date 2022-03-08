@@ -39,7 +39,7 @@ import (
 	"github.com/minio/mc/pkg/disk"
 	"github.com/minio/mc/pkg/hookreader"
 	"github.com/minio/mc/pkg/probe"
-	minio "github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/minio/minio-go/v7/pkg/lifecycle"
 	"github.com/minio/minio-go/v7/pkg/notification"
@@ -59,20 +59,29 @@ const (
 	metadataKeyS3Cmd = "X-Amz-Meta-S3cmd-Attrs"
 )
 
-var ( // GOOS specific ignore list.
-	ignoreFiles = map[string][]string{
-		"darwin":  {"*.DS_Store"},
-		"default": {"lost+found"},
-	}
-)
+// GOOS specific ignore list.
+var ignoreFiles = map[string][]string{
+	"darwin":  {"*.DS_Store"},
+	"default": {"lost+found"},
+}
 
 // fsNew - instantiate a new fs
 func fsNew(path string) (Client, *probe.Error) {
 	if strings.TrimSpace(path) == "" {
 		return nil, probe.NewError(EmptyPath{})
 	}
+	absPath, e := filepath.Abs(path)
+	if e != nil {
+		return nil, probe.NewError(e)
+	}
+	// filepath.Abs removes the trailing slash in a path
+	// but we still need it because fsClient.List() does not
+	// traverse a directory without a trailing slash in the name
+	if path[len(path)-1] == filepath.Separator {
+		absPath += string(filepath.Separator)
+	}
 	return &fsClient{
-		PathURL: newClientURL(normalizePath(path)),
+		PathURL: newClientURL(normalizePath(absPath)),
 	}, nil
 }
 
@@ -172,6 +181,9 @@ func (f *fsClient) Watch(ctx context.Context, options WatchOptions) (*WatchObjec
 		close(eventChan)
 		close(errorChan)
 		notify.Stop(in)
+		// At this point, notify is guaranteed to not write
+		// in 'in' channel so we can close it.
+		close(in)
 	}()
 
 	timeFormatFS := "2006-01-02T15:04:05.000Z"
@@ -274,7 +286,7 @@ func (f *fsClient) put(ctx context.Context, reader io.Reader, size int64, progre
 
 	if objectDir != "" {
 		// Create any missing top level directories.
-		if e := os.MkdirAll(objectDir, 0777); e != nil {
+		if e := os.MkdirAll(objectDir, 0o777); e != nil {
 			err := f.toClientError(e, f.PathURL.Path)
 			return 0, err.Trace(f.PathURL.Path)
 		}
@@ -294,7 +306,7 @@ func (f *fsClient) put(ctx context.Context, reader io.Reader, size int64, progre
 	// should remove any partial download if any.
 	defer os.Remove(objectPartPath)
 
-	tmpFile, e := os.OpenFile(objectPartPath, os.O_CREATE|os.O_WRONLY, 0666)
+	tmpFile, e := os.OpenFile(objectPartPath, os.O_CREATE|os.O_WRONLY, 0o666)
 	if e != nil {
 		err := f.toClientError(e, f.PathURL.Path)
 		return 0, err.Trace(f.PathURL.Path)
@@ -449,7 +461,7 @@ func isSysErrNotEmpty(err error) bool {
 // deleteFile deletes a file path if its empty. If it's successfully deleted,
 // it will recursively delete empty parent directories
 // until it finds one with files in it. Returns nil for a non-empty directory.
-func deleteFile(deletePath string) error {
+func deleteFile(basePath, deletePath string) error {
 	// Attempt to remove path.
 	if e := os.Remove(deletePath); e != nil {
 		if isSysErrNotEmpty(e) {
@@ -466,24 +478,33 @@ func deleteFile(deletePath string) error {
 	parentPath := strings.TrimSuffix(deletePath, slashSeperator)
 	parentPath = path.Dir(parentPath)
 
+	if !strings.HasPrefix(parentPath, basePath) {
+		// If parentPath jumps out of the original basePath,
+		// make sure to cancel such calls, we don't want
+		// to be deleting more than we should.
+		return nil
+	}
+
 	if parentPath != "." {
-		return deleteFile(parentPath)
+		return deleteFile(basePath, parentPath)
 	}
 
 	return nil
 }
 
 // Remove - remove entry read from clientContent channel.
-func (f *fsClient) Remove(ctx context.Context, isIncomplete, isRemoveBucket, isBypass bool, contentCh <-chan *ClientContent) <-chan *probe.Error {
-	errorCh := make(chan *probe.Error)
+func (f *fsClient) Remove(ctx context.Context, isIncomplete, isRemoveBucket, isBypass bool, contentCh <-chan *ClientContent) <-chan RemoveResult {
+	resultCh := make(chan RemoveResult)
 
 	// Goroutine reads from contentCh and removes the entry in content.
 	go func() {
-		defer close(errorCh)
+		defer close(resultCh)
 
 		for content := range contentCh {
 			if content.Err != nil {
-				errorCh <- content.Err
+				resultCh <- RemoveResult{
+					Err: content.Err,
+				}
 				continue
 			}
 			name := content.URL.Path
@@ -491,31 +512,48 @@ func (f *fsClient) Remove(ctx context.Context, isIncomplete, isRemoveBucket, isB
 			if isIncomplete {
 				name += partSuffix
 			}
-			e := deleteFile(name)
+			e := deleteFile(f.PathURL.Path, name)
 			if e == nil {
+				_, objectName := url2BucketAndObject(&content.URL, false)
+				res := RemoveResult{}
+				res.ObjectName = objectName
+				resultCh <- res
 				continue
 			}
-			if os.IsNotExist(e) && isRemoveBucket {
-				// ignore PathNotFound for dir removal.
-				return
+			if os.IsNotExist(e) {
+				// ignore if path already removed.
+				continue
 			}
 			if os.IsPermission(e) {
 				// Ignore permission error.
-				errorCh <- probe.NewError(PathInsufficientPermission{Path: content.URL.Path})
+				resultCh <- RemoveResult{
+					Err: probe.NewError(PathInsufficientPermission{
+						Path: content.URL.Path,
+					}),
+				}
 			} else {
-				errorCh <- probe.NewError(e)
+				resultCh <- RemoveResult{
+					Err: probe.NewError(e),
+				}
 				return
 			}
 		}
 	}()
 
-	return errorCh
+	return resultCh
 }
 
 // List - list files and folders.
 func (f *fsClient) List(ctx context.Context, opts ListOptions) <-chan *ClientContent {
-	contentCh := make(chan *ClientContent)
-	filteredCh := make(chan *ClientContent)
+	contentCh := make(chan *ClientContent, 1)
+	filteredCh := make(chan *ClientContent, 1)
+	if opts.ListZip {
+		contentCh <- &ClientContent{
+			Err: probe.NewError(errors.New("zip listing not supported for local files")),
+		}
+		close(filteredCh)
+		return filteredCh
+	}
 
 	if opts.Recursive {
 		if opts.ShowDir == DirNone {
@@ -725,6 +763,14 @@ func (f *fsClient) listDirOpt(contentCh chan *ClientContent, isIncomplete bool, 
 	listDir = func(currentPath string) (isStop bool) {
 		files, e := readDir(currentPath)
 		if e != nil {
+			if os.IsNotExist(e) {
+				contentCh <- &ClientContent{
+					Err: probe.NewError(PathNotFound{
+						Path: currentPath,
+					}),
+				}
+				return false
+			}
 			if os.IsPermission(e) {
 				contentCh <- &ClientContent{
 					Err: probe.NewError(PathInsufficientPermission{
@@ -894,7 +940,7 @@ func (f *fsClient) MakeBucket(ctx context.Context, region string, ignoreExisting
 	// to call os.Mkdir() when ignoredExisting is disabled and os.MkdirAll()
 	// otherwise.
 	// NOTE: withLock=true has no meaning here.
-	e := os.MkdirAll(f.PathURL.Path, 0777)
+	e := os.MkdirAll(f.PathURL.Path, 0o777)
 	if e != nil {
 		return probe.NewError(e)
 	}
@@ -982,11 +1028,11 @@ func (f *fsClient) GetAccess(ctx context.Context) (access string, policyJSON str
 	}
 	// Mask with os.ModePerm to get only inode permissions
 	switch st.Mode() & os.ModePerm {
-	case os.FileMode(0777):
+	case os.FileMode(0o777):
 		return "readwrite", "", nil
-	case os.FileMode(0555):
+	case os.FileMode(0o555):
 		return "readonly", "", nil
-	case os.FileMode(0333):
+	case os.FileMode(0o333):
 		return "writeonly", "", nil
 	}
 	return "none", "", nil
@@ -1009,13 +1055,13 @@ func (f *fsClient) SetAccess(ctx context.Context, access string, isJSON bool) *p
 	var mode os.FileMode
 	switch access {
 	case "readonly":
-		mode = os.FileMode(0555)
+		mode = os.FileMode(0o555)
 	case "writeonly":
-		mode = os.FileMode(0333)
+		mode = os.FileMode(0o333)
 	case "readwrite":
-		mode = os.FileMode(0777)
+		mode = os.FileMode(0o777)
 	case "none":
-		mode = os.FileMode(0755)
+		mode = os.FileMode(0o755)
 	}
 	e := os.Chmod(f.PathURL.Path, mode)
 	if e != nil {
@@ -1178,7 +1224,6 @@ func (f *fsClient) RemoveReplication(ctx context.Context) *probe.Error {
 		API:     "RemoveReplication",
 		APIType: "filesystem",
 	})
-
 }
 
 // GetReplicationMetrics - Get replication metrics for a given bucket, not implemented.
@@ -1194,6 +1239,14 @@ func (f *fsClient) GetReplicationMetrics(ctx context.Context) (replication.Metri
 func (f *fsClient) ResetReplication(ctx context.Context, before time.Duration, arn string) (rinfo replication.ResyncTargetsInfo, err *probe.Error) {
 	return rinfo, probe.NewError(APINotImplemented{
 		API:     "ResetReplication",
+		APIType: "filesystem",
+	})
+}
+
+// ReplicationResyncStatus - gets status of replication resync for this target arn
+func (f *fsClient) ReplicationResyncStatus(ctx context.Context, arn string) (rinfo replication.ResyncTargetsInfo, err *probe.Error) {
+	return rinfo, probe.NewError(APINotImplemented{
+		API:     "ReplicationResyncStatus",
 		APIType: "filesystem",
 	})
 }

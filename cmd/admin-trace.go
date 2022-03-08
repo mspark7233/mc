@@ -104,7 +104,7 @@ EXAMPLES:
     {{.Prompt}} {{.HelpName}} -v --status-code 503 myminio
 
   4. Show console trace for a specific path
-    {{.Prompt}} {{.HelpName}} --path my-bucket/my-prefix/ myminio
+    {{.Prompt}} {{.HelpName}} --path my-bucket/my-prefix/* myminio
 
   5. Show console trace for requests with '404' and '503' status code
     {{.Prompt}} {{.HelpName}} --status-code 404 --status-code 503 myminio
@@ -113,9 +113,7 @@ EXAMPLES:
 
 const timeFormat = "2006-01-02T15:04:05:000"
 
-var (
-	colors = []color.Attribute{color.FgCyan, color.FgWhite, color.FgYellow, color.FgGreen}
-)
+var colors = []color.Attribute{color.FgCyan, color.FgWhite, color.FgYellow, color.FgGreen}
 
 func checkAdminTraceSyntax(ctx *cli.Context) {
 	if len(ctx.Args()) != 1 {
@@ -205,7 +203,6 @@ func matchTrace(ctx *cli.Context, traceInfo madmin.ServiceTraceInfo) bool {
 
 // Calculate tracing options for command line flags
 func tracingOpts(ctx *cli.Context) (opts madmin.ServiceTraceOpts, e error) {
-
 	if t := ctx.String("response-threshold"); t != "" {
 		d, e := time.ParseDuration(t)
 		if e != nil {
@@ -423,7 +420,7 @@ func (s shortTraceMsg) JSON() string {
 
 func (s shortTraceMsg) String() string {
 	var hostStr string
-	var b = &strings.Builder{}
+	b := &strings.Builder{}
 
 	if s.Host != "" {
 		hostStr = colorizedNodeName(s.Host)
@@ -542,7 +539,7 @@ func (t traceMessage) JSON() string {
 
 func (t traceMessage) String() string {
 	var nodeNameStr string
-	var b = &strings.Builder{}
+	b := &strings.Builder{}
 
 	trc := t.Trace
 	if trc.NodeName != "" {

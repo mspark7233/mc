@@ -24,7 +24,8 @@ import (
 
 var adminUserSvcAcctRemoveCmd = cli.Command{
 	Name:         "rm",
-	Usage:        "Remove a service account",
+	Aliases:      []string{"remove"},
+	Usage:        "remove a service account",
 	Action:       mainAdminUserSvcAcctRemove,
 	OnUsageError: onUsageError,
 	Before:       setGlobalsFromContext,
@@ -39,7 +40,7 @@ FLAGS:
   {{range .VisibleFlags}}{{.}}
   {{end}}
 EXAMPLES:
-  1. Remove the service account 'J123C4ZXEQN8RK6ND35I' from MinIO server.
+  1. Remove a service account 'J123C4ZXEQN8RK6ND35I' from MinIO server.
      {{.Prompt}} {{.HelpName}} myminio/ J123C4ZXEQN8RK6ND35I
 `,
 }
@@ -47,8 +48,7 @@ EXAMPLES:
 // checkAdminUserSvcAcctRemoveSyntax - validate all the passed arguments
 func checkAdminUserSvcAcctRemoveSyntax(ctx *cli.Context) {
 	if len(ctx.Args()) != 2 {
-		fatalIf(errInvalidArgument().Trace(ctx.Args().Tail()...),
-			"Incorrect number of arguments for user svcacct rm command.")
+		cli.ShowCommandHelpAndExit(ctx, "rm", 1)
 	}
 }
 

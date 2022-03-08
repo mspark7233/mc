@@ -29,34 +29,32 @@ import (
 	"github.com/minio/pkg/console"
 )
 
-var (
-	retentionSetFlags = []cli.Flag{
-		cli.BoolFlag{
-			Name:  "recursive, r",
-			Usage: "apply retention recursively",
-		},
-		cli.BoolFlag{
-			Name:  "bypass",
-			Usage: "bypass governance",
-		},
-		cli.StringFlag{
-			Name:  "version-id, vid",
-			Usage: "apply retention to a specific object version",
-		},
-		cli.StringFlag{
-			Name:  "rewind",
-			Usage: "roll back object(s) to current version at specified time",
-		},
-		cli.BoolFlag{
-			Name:  "versions",
-			Usage: "apply retention object(s) and all its versions",
-		},
-		cli.BoolFlag{
-			Name:  "default",
-			Usage: "set bucket default retention mode",
-		},
-	}
-)
+var retentionSetFlags = []cli.Flag{
+	cli.BoolFlag{
+		Name:  "recursive, r",
+		Usage: "apply retention recursively",
+	},
+	cli.BoolFlag{
+		Name:  "bypass",
+		Usage: "bypass governance",
+	},
+	cli.StringFlag{
+		Name:  "version-id, vid",
+		Usage: "apply retention to a specific object version",
+	},
+	cli.StringFlag{
+		Name:  "rewind",
+		Usage: "roll back object(s) to current version at specified time",
+	},
+	cli.BoolFlag{
+		Name:  "versions",
+		Usage: "apply retention object(s) and all its versions",
+	},
+	cli.BoolFlag{
+		Name:  "default",
+		Usage: "set bucket default retention mode",
+	},
+}
 
 var retentionSetCmd = cli.Command{
 	Name:         "set",
@@ -92,10 +90,15 @@ EXAMPLES:
 
   5. Set default lock retention configuration for a bucket
      $ {{.HelpName}} --default governance 30d myminio/mybucket/
-`}
+`,
+}
 
 func parseSetRetentionArgs(cliCtx *cli.Context) (target, versionID string, recursive bool, timeRef time.Time, withVersions bool, mode minio.RetentionMode, validity uint64, unit minio.ValidityUnit, bypass, bucketMode bool) {
 	args := cliCtx.Args()
+	if len(args) != 3 {
+		cli.ShowCommandHelpAndExit(cliCtx, "set", 1)
+	}
+
 	mode = minio.RetentionMode(strings.ToUpper(args[0]))
 	if !mode.IsValid() {
 		fatalIf(errInvalidArgument().Trace(args...), "invalid retention mode '%v'", mode)
@@ -114,7 +117,13 @@ func parseSetRetentionArgs(cliCtx *cli.Context) (target, versionID string, recur
 	timeRef = parseRewindFlag(cliCtx.String("rewind"))
 	withVersions = cliCtx.Bool("versions")
 	recursive = cliCtx.Bool("recursive")
+	bypass = cliCtx.Bool("bypass")
 	bucketMode = cliCtx.Bool("default")
+
+	if bucketMode && (versionID != "" || !timeRef.IsZero() || withVersions || recursive || bypass) {
+		fatalIf(errDummy(), "--default cannot be specified with any of --version-id, --rewind, --versions, --recursive, --bypass.")
+	}
+
 	return
 }
 
@@ -135,10 +144,6 @@ func mainRetentionSet(cliCtx *cli.Context) error {
 
 	console.SetColor("RetentionSuccess", color.New(color.FgGreen, color.Bold))
 	console.SetColor("RetentionFailure", color.New(color.FgYellow))
-
-	if len(cliCtx.Args()) != 3 {
-		cli.ShowCommandHelpAndExit(cliCtx, "set", 1)
-	}
 
 	target, versionID, recursive, rewind, withVersions, mode, validity, unit, bypass, bucketMode := parseSetRetentionArgs(cliCtx)
 

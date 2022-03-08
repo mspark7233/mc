@@ -25,7 +25,7 @@ import (
 	"time"
 
 	"github.com/minio/mc/pkg/probe"
-	minio "github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/minio/minio-go/v7/pkg/lifecycle"
 	"github.com/minio/minio-go/v7/pkg/replication"
@@ -47,6 +47,7 @@ const (
 type GetOptions struct {
 	SSE       encrypt.ServerSide
 	VersionID string
+	Zip       bool
 }
 
 // PutOptions holds options for PUT operation
@@ -67,6 +68,7 @@ type StatOptions struct {
 	sse        encrypt.ServerSide
 	timeRef    time.Time
 	versionID  string
+	isZip      bool
 }
 
 // ListOptions holds options for listing operation
@@ -76,6 +78,7 @@ type ListOptions struct {
 	WithMetadata      bool
 	WithOlderVersions bool
 	WithDeleteMarkers bool
+	ListZip           bool
 	TimeRef           time.Time
 	ShowDir           DirOpt
 	Count             int
@@ -96,7 +99,6 @@ type CopyOptions struct {
 type Client interface {
 	// Common operations
 	Stat(ctx context.Context, opts StatOptions) (content *ClientContent, err *probe.Error)
-
 	List(ctx context.Context, opts ListOptions) <-chan *ClientContent
 
 	// Bucket operations
@@ -120,7 +122,6 @@ type Client interface {
 
 	// I/O operations with metadata.
 	Get(ctx context.Context, opts GetOptions) (reader io.ReadCloser, err *probe.Error)
-
 	Put(ctx context.Context, reader io.Reader, size int64, progress io.Reader, opts PutOptions) (n int64, err *probe.Error)
 
 	// Object Locking related API
@@ -137,10 +138,9 @@ type Client interface {
 	Watch(ctx context.Context, options WatchOptions) (*WatchObject, *probe.Error)
 
 	// Delete operations
-	Remove(ctx context.Context, isIncomplete, isRemoveBucket, isBypass bool, contentCh <-chan *ClientContent) (errorCh <-chan *probe.Error)
+	Remove(ctx context.Context, isIncomplete, isRemoveBucket, isBypass bool, contentCh <-chan *ClientContent) (errorCh <-chan RemoveResult)
 	// GetURL returns back internal url
 	GetURL() ClientURL
-
 	AddUserAgent(app, version string)
 
 	// Tagging operations
@@ -161,6 +161,8 @@ type Client interface {
 	RemoveReplication(ctx context.Context) *probe.Error
 	GetReplicationMetrics(ctx context.Context) (replication.Metrics, *probe.Error)
 	ResetReplication(ctx context.Context, before time.Duration, arn string) (replication.ResyncTargetsInfo, *probe.Error)
+	ReplicationResyncStatus(ctx context.Context, arn string) (rinfo replication.ResyncTargetsInfo, err *probe.Error)
+
 	// Encryption operations
 	GetEncryption(ctx context.Context) (string, string, *probe.Error)
 	SetEncryption(ctx context.Context, algorithm, kmsKeyID string) *probe.Error
@@ -175,6 +177,7 @@ type Client interface {
 // ClientContent - Content container for content metadata
 type ClientContent struct {
 	URL          ClientURL
+	BucketName   string // only valid and set for client-type objectStorage
 	Time         time.Time
 	Size         int64
 	Type         os.FileMode

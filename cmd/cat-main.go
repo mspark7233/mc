@@ -34,18 +34,20 @@ import (
 	"github.com/minio/mc/pkg/probe"
 )
 
-var (
-	catFlags = []cli.Flag{
-		cli.StringFlag{
-			Name:  "rewind",
-			Usage: "display an earlier object version",
-		},
-		cli.StringFlag{
-			Name:  "version-id, vid",
-			Usage: "display a specific version of an object",
-		},
-	}
-)
+var catFlags = []cli.Flag{
+	cli.StringFlag{
+		Name:  "rewind",
+		Usage: "display an earlier object version",
+	},
+	cli.StringFlag{
+		Name:  "version-id, vid",
+		Usage: "display a specific version of an object",
+	},
+	cli.BoolFlag{
+		Name:  "zip",
+		Usage: "Extract from remote zip file (MinIO server source only)",
+	},
+}
 
 // Display contents of a file.
 var catCmd = cli.Command{
@@ -59,11 +61,11 @@ var catCmd = cli.Command{
   {{.HelpName}} - {{.Usage}}
 
 USAGE:
-  {{.HelpName}} [FLAGS] SOURCE [SOURCE...]
-{{if .VisibleFlags}}
+  {{.HelpName}} [FLAGS] TARGET [TARGET...]
+
 FLAGS:
   {{range .VisibleFlags}}{{.}}
-  {{end}}{{end}}
+  {{end}}
 ENVIRONMENT VARIABLES:
   MC_ENCRYPT_KEY:  list of comma delimited prefix=secret values
 
@@ -167,14 +169,14 @@ func parseCatSyntax(ctx *cli.Context) (args []string, versionID string, timeRef 
 }
 
 // catURL displays contents of a URL to stdout.
-func catURL(ctx context.Context, sourceURL, sourceVersion string, timeRef time.Time, encKeyDB map[string][]prefixSSEPair) *probe.Error {
+func catURL(ctx context.Context, sourceURL, sourceVersion string, timeRef time.Time, encKeyDB map[string][]prefixSSEPair, isZip bool) *probe.Error {
 	var reader io.ReadCloser
 	size := int64(-1)
 	switch sourceURL {
 	case "-":
 		reader = os.Stdin
 	default:
-		var versionID = sourceVersion
+		versionID := sourceVersion
 		var err *probe.Error
 		// Try to stat the object, the purpose is to:
 		// 1. extract the size of S3 object so we can check if the size of the
@@ -182,7 +184,7 @@ func catURL(ctx context.Context, sourceURL, sourceVersion string, timeRef time.T
 		// are ignored since some of them have zero size though they
 		// have contents like files under /proc.
 		// 2. extract the version ID if rewind flag is passed
-		if client, content, err := url2Stat(ctx, sourceURL, sourceVersion, false, encKeyDB, timeRef); err == nil {
+		if client, content, err := url2Stat(ctx, sourceURL, sourceVersion, false, encKeyDB, timeRef, isZip); err == nil {
 			if sourceVersion == "" {
 				versionID = content.VersionID
 			}
@@ -192,7 +194,7 @@ func catURL(ctx context.Context, sourceURL, sourceVersion string, timeRef time.T
 		} else {
 			return err.Trace(sourceURL)
 		}
-		if reader, err = getSourceStreamFromURL(ctx, sourceURL, versionID, encKeyDB); err != nil {
+		if reader, err = getSourceStreamFromURL(ctx, sourceURL, versionID, encKeyDB, isZip); err != nil {
 			return err.Trace(sourceURL)
 		}
 		defer reader.Close()
@@ -262,6 +264,7 @@ func mainCat(cliCtx *cli.Context) error {
 	if len(args) == 0 {
 		stdinMode = true
 	}
+	isZip := cliCtx.Bool("zip")
 
 	// handle std input data.
 	if stdinMode {
@@ -282,7 +285,7 @@ func mainCat(cliCtx *cli.Context) error {
 
 	// Convert arguments to URLs: expand alias, fix format.
 	for _, url := range args {
-		fatalIf(catURL(ctx, url, versionID, rewind, encKeyDB).Trace(url), "Unable to read from `"+url+"`.")
+		fatalIf(catURL(ctx, url, versionID, rewind, encKeyDB, isZip).Trace(url), "Unable to read from `"+url+"`.")
 	}
 
 	return nil

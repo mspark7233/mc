@@ -23,11 +23,14 @@ var adminTierSubCommands = []cli.Command{
 	adminTierAddCmd,
 	adminTierListCmd,
 	adminTierEditCmd,
+	adminTierRmCmd,
+	adminTierVerifyCmd,
+	adminTierInfoCmd,
 }
 
 var adminTierCmd = cli.Command{
 	Name:            "tier",
-	Usage:           "configure remote tier targets for ILM transition",
+	Usage:           "manage remote tier targets for ILM transition",
 	Action:          mainAdminTier,
 	Before:          setGlobalsFromContext,
 	Flags:           globalFlags,
@@ -39,5 +42,5 @@ var adminTierCmd = cli.Command{
 func mainAdminTier(ctx *cli.Context) error {
 	commandNotFound(ctx, adminTierSubCommands)
 	return nil
-	// Sub-commands like "add", "ls" and "edit" have their own main.
+	// Sub-commands like "add", "ls", "edit", "rm" and "verify" have their own main.
 }
