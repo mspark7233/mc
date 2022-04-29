@@ -38,11 +38,11 @@ var (
 		},
 		cli.StringFlag{
 			Name:  "older-than",
-			Usage: "move objects older than L days, M hours and N minutes",
+			Usage: "move objects older than value in duration string (e.g. 7d10h31s)",
 		},
 		cli.StringFlag{
 			Name:  "newer-than",
-			Usage: "move objects newer than L days, M hours and N minutes",
+			Usage: "move objects newer than value in duration string (e.g. 7d10h31s)",
 		},
 		cli.StringFlag{
 			Name:  "storage-class, sc",
@@ -241,18 +241,12 @@ func mainMove(cliCtx *cli.Context) error {
 	// Check if source URLs does not have object locking enabled
 	// since we cannot move them (remove them from the source)
 	for _, urlStr := range cliCtx.Args()[:cliCtx.NArg()-1] {
-		client, err := newClient(urlStr)
+		enabled, err := isBucketLockEnabled(ctx, urlStr)
 		if err != nil {
-			fatalIf(err.Trace(), "Unable to parse the provided url.")
+			fatalIf(err.Trace(), "Unable to get bucket lock configuration of `%s`", urlStr)
 		}
-		if _, ok := client.(*S3Client); ok {
-			enabled, err := isBucketLockEnabled(ctx, urlStr)
-			if err != nil {
-				fatalIf(err.Trace(), "Unable to get bucket lock configuration of `%s`", urlStr)
-			}
-			if enabled {
-				fatalIf(errDummy().Trace(), fmt.Sprintf("Object lock configuration is enabled on the specified bucket in alias %v.", urlStr))
-			}
+		if enabled {
+			fatalIf(errDummy().Trace(), fmt.Sprintf("Object lock configuration is enabled on the specified bucket in alias %v.", urlStr))
 		}
 	}
 

@@ -55,7 +55,12 @@ var (
 			Usage: "overwrite object(s) on target if it differs from source",
 		},
 		cli.BoolFlag{
-			Name:  "fake",
+			Name:   "fake",
+			Usage:  "perform a fake mirror operation",
+			Hidden: true, // deprecated 2022
+		},
+		cli.BoolFlag{
+			Name:  "dry-run",
 			Usage: "perform a fake mirror operation",
 		},
 		cli.BoolFlag{
@@ -98,11 +103,11 @@ var (
 		},
 		cli.StringFlag{
 			Name:  "older-than",
-			Usage: "filter object(s) older than L days, M hours and N minutes",
+			Usage: "filter object(s) older than value in duration string (e.g. 7d10h31s)",
 		},
 		cli.StringFlag{
 			Name:  "newer-than",
-			Usage: "filter object(s) newer than L days, M hours and N minutes",
+			Usage: "filter object(s) newer than value in duration string (e.g. 7d10h31s)",
 		},
 		cli.StringFlag{
 			Name:  "storage-class, sc",
@@ -510,11 +515,13 @@ func (mj *mirrorJob) monitorMirrorStatus(cancel context.CancelFunc) (errDuringMi
 				errDuringMirror = true
 			}
 
-			if mj.opts.activeActive {
+			// Do not quit mirroring if we are in --watch or --active-active mode
+			if !mj.opts.activeActive && !mj.opts.isWatch {
 				cancel()
 				cancelInProgress = true
-				continue
 			}
+
+			continue
 		}
 
 		if sURLs.SourceContent != nil {
@@ -522,8 +529,7 @@ func (mj *mirrorJob) monitorMirrorStatus(cancel context.CancelFunc) (errDuringMi
 		} else if sURLs.TargetContent != nil {
 			// Construct user facing message and path.
 			targetPath := filepath.ToSlash(filepath.Join(sURLs.TargetAlias, sURLs.TargetContent.URL.Path))
-			size := sURLs.TargetContent.Size
-			mj.status.PrintMsg(rmMessage{Key: targetPath, Size: size})
+			mj.status.PrintMsg(rmMessage{Key: targetPath})
 		}
 	}
 
@@ -869,9 +875,10 @@ func runMirror(ctx context.Context, cancelMirror context.CancelFunc, srcURL, dst
 	// preserve is also expected to be overwritten if necessary
 	isMetadata := cli.Bool("a") || isWatch || len(userMetadata) > 0
 	isOverwrite = isOverwrite || isMetadata
+	isFake := cli.Bool("fake") || cli.Bool("dry-run")
 
 	mopts := mirrorOptions{
-		isFake:           cli.Bool("fake"),
+		isFake:           isFake,
 		isRemove:         isRemove,
 		isOverwrite:      isOverwrite,
 		isWatch:          isWatch,
@@ -939,6 +946,16 @@ func runMirror(ctx context.Context, cancelMirror context.CancelFunc, srcURL, dst
 						withLock = true
 					}
 				}
+
+				mj.status.PrintMsg(mirrorMessage{
+					Source: newSrcURL,
+					Target: newTgtURL,
+				})
+
+				if mj.opts.isFake {
+					continue
+				}
+
 				// Bucket only exists in the source, create the same bucket in the destination
 				if err := newDstClt.MakeBucket(ctx, cli.String("region"), false, withLock); err != nil {
 					errorIf(err, "Unable to create bucket at `"+newTgtURL+"`.")

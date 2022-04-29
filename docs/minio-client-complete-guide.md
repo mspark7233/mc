@@ -829,8 +829,8 @@ FLAGS:
   --rewind value                     roll back object(s) to current version at specified time
   --version-id value, --vid value    select an object version to copy
   --recursive, -r                    copy recursively
-  --older-than value                 copy object(s) older than N days (default: 0)
-  --newer-than value                 copy object(s) newer than N days (default: 0)
+  --older-than value                 copy object(s) older than value in duration string (e.g. 7d10h31s)
+  --newer-than value                 copy object(s) newer than value in duration string (e.g. 7d10h31s)
   --storage-class value, --sc value  set storage class for new object(s) on target
   --preserve,-a                      preserve file system attributes and bucket policy rules on target bucket(s)
   --attr                             add custom metadata for the object (format: KeyName1=string;KeyName2=string)
@@ -917,8 +917,8 @@ USAGE:
 
 FLAGS:
   --recursive, -r                    move recursively
-  --older-than value                 move object(s) older than N days (default: 0)
-  --newer-than value                 move object(s) newer than N days (default: 0)
+  --older-than value                 move object(s) older than value in duration string (e.g. 7d10h31s)
+  --newer-than value                 move object(s) newer than value in duration string (e.g. 7d10h31s)
   --storage-class value, --sc value  set storage class for new object(s) on target
   --preserve,-a                      preserve file system attributes and bucket policy rules on target bucket(s)
   --attr                             add custom metadata for the object (format: KeyName1=string;KeyName2=string)
@@ -1012,10 +1012,10 @@ FLAGS:
   --force                          allow a recursive remove operation
   --dangerous                      allow site-wide removal of objects
   --incomplete, -I                 remove incomplete uploads
-  --fake                           perform a fake remove operation
+  --dry-run                        perform a fake remove operation
   --stdin                          read object names from STDIN
-  --older-than value               remove objects older than L days, M hours and N minutes
-  --newer-than value               remove objects newer than L days, M hours and N minutes
+  --older-than value               remove objects older than value in duration string (e.g. 7d10h31s)
+  --newer-than value               remove objects newer than value in duration string (e.g. 7d10h31s)
   --bypass                         bypass governance
   --encrypt-key value              encrypt/decrypt objects (using server-side encryption with customer provided keys)
   --help, -h                       show help
@@ -1172,14 +1172,14 @@ USAGE:
 
 FLAGS:
   --overwrite                        overwrite object(s) on target if it differs from source
-  --fake                             perform a fake mirror operation
+  --dry-run                          perform a fake mirror operation
   --watch, -w                        watch and synchronize changes
   --remove                           remove extraneous object(s) on target
   --region value                     specify region when creating new bucket(s) on target (default: "us-east-1")
   --preserve, -a                     preserve file system attributes and bucket policy rules on target bucket(s)
   --exclude value                    exclude object(s) that match specified object name pattern
-  --older-than value                 filter object(s) older than N days (default: 0)
-  --newer-than value                 filter object(s) newer than N days (default: 0)
+  --older-than value                 filter object(s) older than value in duration string (e.g. 7d10h31s)
+  --newer-than value                 filter object(s) newer than value in duration string (e.g. 7d10h31s)
   --storage-class value, --sc value  specify storage class for new object(s) on target
   --encrypt value                    encrypt/decrypt objects (using server-side encryption with server managed keys)
   --encrypt-key value                encrypt/decrypt objects (using server-side encryption with customer provided keys)
@@ -1216,8 +1216,8 @@ FLAGS:
   --exec value                  spawn an external process for each matching object (see FORMAT)
   --ignore value                exclude objects matching the wildcard pattern
   --name value                  find object names matching wildcard pattern
-  --newer value                 match all objects newer than specified time L days, M hours and N minutes
-  --older value                 match all objects older than specified time L days, M hours and N minutes
+  --newer value                 match all objects newer than value in duration string (e.g. 7d10h31s)
+  --older value                 match all objects older than value in duration string (e.g. 7d10h31s)
   --path value                  match directory names matching wildcard pattern
   --print value                 print in custom format to STDOUT (see FORMAT)
   --regex value                 match directory and object name with PCRE regex pattern

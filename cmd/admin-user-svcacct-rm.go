@@ -18,8 +18,10 @@
 package cmd
 
 import (
+	"github.com/fatih/color"
 	"github.com/minio/cli"
 	"github.com/minio/mc/pkg/probe"
+	"github.com/minio/pkg/console"
 )
 
 var adminUserSvcAcctRemoveCmd = cli.Command{
@@ -54,6 +56,8 @@ func checkAdminUserSvcAcctRemoveSyntax(ctx *cli.Context) {
 
 // mainAdminUserSvcAcctRemove is the handle for "mc admin user svcacct rm" command.
 func mainAdminUserSvcAcctRemove(ctx *cli.Context) error {
+	console.SetColor("SVCMessage", color.New(color.FgGreen))
+
 	checkAdminUserSvcAcctRemoveSyntax(ctx)
 
 	// Get the alias parameter from cli
@@ -66,10 +70,10 @@ func mainAdminUserSvcAcctRemove(ctx *cli.Context) error {
 	fatalIf(err, "Unable to initialize admin connection.")
 
 	e := client.DeleteServiceAccount(globalContext, svcAccount)
-	fatalIf(probe.NewError(e).Trace(args...), "Unable to remove a new service account")
+	fatalIf(probe.NewError(e).Trace(args...), "Unable to remove the specified service account")
 
 	printMsg(svcAcctMessage{
-		op:        "ls",
+		op:        "rm",
 		AccessKey: svcAccount,
 	})
 
