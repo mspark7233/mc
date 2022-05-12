@@ -865,7 +865,7 @@ func runMirror(ctx context.Context, cancelMirror context.CancelFunc, srcURL, dst
 	srcClt, err := newClient(srcURL)
 	fatalIf(err, "Unable to initialize `"+srcURL+"`.")
 
-	dstClt, err := newClient(dstURL)
+	dstClt, err := newClient(iconvCP949ToUTF8(dstURL))
 	fatalIf(err, "Unable to initialize `"+dstURL+"`.")
 
 	// This is kept for backward compatibility, `--force` means --overwrite.
