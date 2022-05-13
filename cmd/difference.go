@@ -265,7 +265,7 @@ func differenceInternal(ctx context.Context, sourceClnt, targetClnt Client, isMe
 		tgtSuffix := strings.TrimPrefix(tgtCtnt.URL.String(), targetClnt.GetURL().String())
 
 		current := iconvCP949ToUTF8(urlJoinPath(targetClnt.GetURL().String(), srcSuffix))
-		expected := iconvCP949ToUTF8(urlJoinPath(targetClnt.GetURL().String(), tgtSuffix))
+		expected := urlJoinPath(targetClnt.GetURL().String(), tgtSuffix)
 
 		if !utf8.ValidString(srcSuffix) && !isCP949(srcSuffix) {
 			// Error. Keys must be valid UTF-8.
