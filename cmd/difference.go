@@ -264,16 +264,16 @@ func differenceInternal(ctx context.Context, sourceClnt, targetClnt Client, isMe
 		srcSuffix := strings.TrimPrefix(srcCtnt.URL.String(), sourceClnt.GetURL().String())
 		tgtSuffix := strings.TrimPrefix(tgtCtnt.URL.String(), targetClnt.GetURL().String())
 
-		current := urlJoinPath(targetClnt.GetURL().String(), srcSuffix)
-		expected := urlJoinPath(targetClnt.GetURL().String(), tgtSuffix)
+		current := iconvCP949ToUTF8(urlJoinPath(targetClnt.GetURL().String(), srcSuffix))
+		expected := iconvCP949ToUTF8(urlJoinPath(targetClnt.GetURL().String(), tgtSuffix))
 
-		if !utf8.ValidString(srcSuffix) || !isCP949(srcSuffix) {
+		if !utf8.ValidString(srcSuffix) && !isCP949(srcSuffix) {
 			// Error. Keys must be valid UTF-8.
 			diffCh <- diffMessage{Error: errInvalidSource(current).Trace()}
 			srcCtnt, srcOk = <-srcCh
 			continue
 		}
-		if !utf8.ValidString(tgtSuffix) || !isCP949(tgtSuffix) {
+		if !utf8.ValidString(tgtSuffix) && !isCP949(tgtSuffix) {
 			// Error. Keys must be valid UTF-8.
 			diffCh <- diffMessage{Error: errInvalidTarget(expected).Trace()}
 			tgtCtnt, tgtOk = <-tgtCh

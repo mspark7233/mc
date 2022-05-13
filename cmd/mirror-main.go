@@ -574,7 +574,7 @@ func (mj *mirrorJob) watchMirrorEvents(ctx context.Context, events []EventInfo) 
 			continue
 		}
 
-		targetPath := urlJoinPath(mj.targetURL, sourceSuffix)
+		targetPath := iconvCP949ToUTF8(urlJoinPath(mj.targetURL, sourceSuffix))
 
 		// newClient needs the unexpanded  path, newCLientURL needs the expanded path
 		targetAlias, expandedTargetPath, _ := mustExpandAlias(targetPath)
